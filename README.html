@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM Robot Documentation</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f8fb;
+    --card: #ffffff;
+    --text: #172033;
+    --muted: #667085;
+    --border: #d7dce5;
+    --code: #0b1220;
+    --code-text: #e5e7eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b1220;
+      --card: #111827;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --border: #334155;
+      --code: #020617;
+      --code-text: #e2e8f0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+  }
+  main {
+    width: min(1000px, calc(100% - 32px));
+    margin: 28px auto;
+    padding: clamp(20px, 4vw, 46px);
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+  }
+  h1 { font-size: clamp(2rem, 5vw, 3.2rem); margin-top: 0; }
+  h2 {
+    margin-top: 2.2rem;
+    padding-top: .5rem;
+    border-top: 1px solid var(--border);
+  }
+  h3 { margin-top: 1.5rem; }
+  p, li { max-width: 85ch; }
+  code {
+    padding: .15em .35em;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--border) 45%, transparent);
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  pre {
+    overflow-x: auto;
+    padding: 14px 16px;
+    border-radius: 12px;
+    background: var(--code);
+    color: var(--code-text);
+  }
+  pre code { background: transparent; padding: 0; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+  }
+  th, td {
+    padding: 9px 10px;
+    border: 1px solid var(--border);
+    text-align: left;
+  }
+  th { background: color-mix(in srgb, var(--border) 35%, transparent); }
+  .top {
+    color: var(--muted);
+    margin-bottom: 1.5rem;
+  }
+</style>
+</head>
+<body>
+<main>
+<div class="top">ESP32-CAM Robot — complete project reference</div>
+<h1>ESP32-CAM Robot</h1>
+
+<p>A Wi-Fi controlled ESP32-CAM robot with live camera streaming, independent motor PWM control, synchronized motor experiments, camera settings, Wi-Fi fallback AP mode, browser OTA firmware updates, debug/event logging, log export, and a UART0 USB serial console.</p>
+
+<h2>Current feature set</h2>
+
+<h3>Motor control</h3>
+
+<ul>
+<li>Motor driver: <strong>TB6612FNG / SparkFun ROB-14450</strong></li>
+<li><strong>GPIO12 &rarr; PWMA + PWMB</strong> (the two PWM inputs are tied together in the schematic)</li>
+<li><strong>GPIO2 &rarr; AIN1</strong>, <strong>GPIO13 &rarr; AIN2</strong></li>
+<li><strong>GPIO15 &rarr; BIN1</strong>, <strong>GPIO14 &rarr; BIN2</strong></li>
+<li><strong>STBY &rarr; +5V</strong> (hard-wired enabled)</li>
+<li>Motor A / J6 is treated as <strong>left</strong>; Motor B / J7 as <strong>right</strong></li>
+<li>Full PWM range for each motor: <strong>0 to 255</strong></li>
+<li>Independent left/right speed sliders</li>
+<li>Exact <strong>-1 / +1</strong> PWM buttons</li>
+<li><strong>Sync motors</strong> checkbox:</li>
+</ul>
+<p>  - When enabled, changing either motor changes both motors to the same PWM value.</p>
+<p>  - Enabling Sync uses the current left motor value as the initial reference.</p>
+<ul>
+<li>Short full-power startup kick to help overcome motor stiction.</li>
+<li>Forward, left, right, and stop controls.</li>
+<li>The PCB uses a TB6612FNG H-bridge. This firmware keeps the existing forward/left/right/stop browser controls; the motor layer is ready for bidirectional extension.</li>
+</ul>
+
+<h3>Hold to drive, and the motion timeout</h3>
+
+<p>The direction buttons drive only while they are held. Because every command is a plain fire-and-forget request, any single one of them can be lost -- and the one that matters is the <strong>stop</strong>. A dropped stop used to leave a wheel turning until some later command happened to get through.</p>
+
+<p>So the robot no longer relies on hearing the stop:</p>
+
+<ul>
+<li>A held button <strong>repeats its command every 250 ms</strong>.</li>
+<li>If the robot hears no motion command for <strong>600 ms</strong>, it stops the motors itself and logs <code>SAFETY: motion timeout; motors stopped</code>.</li>
+<li>The release sends stop <strong>twice</strong>, 150 ms apart.</li>
+<li>Losing window focus, hiding the tab, or leaving the page also stops.</li>
+</ul>
+
+<p>A lost packet, a closed laptop, a browser that never reported the release, or a robot that drives out of Wi-Fi range now all end the same way: the motors stop within about half a second.</p>
+
+<p>Keepalive repeats are not written to the event log -- several entries a second would bury everything else -- so a held button still shows as one command.</p>
+
+<p>At very low PWM values a motor may buzz without turning. This is useful for experiments because students can identify each motor&#x27;s real starting threshold. Do not leave a stalled motor powered for long periods.</p>
+
+<h2>Motor power hardware</h2>
+
+<p>The schematic uses a <strong>TB6612FNG</strong> dual H-bridge module (SparkFun ROB-14450). Its two PWM-enable inputs, PWMA and PWMB, are both connected to <strong>GPIO12</strong>. To retain independent left/right speed control without changing the PCB, firmware holds GPIO12 high and PWM-modulates one direction input per motor:</p>
+
+<ul>
+<li>Motor A / J6 (left): AIN1 = GPIO2 (PWM), AIN2 = GPIO13 (low for forward)</li>
+<li>Motor B / J7 (right): BIN1 = GPIO15 (PWM), BIN2 = GPIO14 (low for forward)</li>
+<li>PWMA + PWMB: GPIO12 held high</li>
+<li>STBY: tied to +5V</li>
+</ul>
+
+<p>The TB6612FNG is bidirectional hardware. The current web UI still exposes forward, left, right, and stop; adding a reverse command only requires driving the opposite IN pin with PWM.</p>
+
+<h2>Camera</h2>
+
+<p>The ESP32-CAM serves an MJPEG stream on port <strong>81</strong>.</p>
+
+<h3>Overlays on the video</h3>
+
+<p><strong>Bottom left</strong> -- the workshop-diy.org mark, held at 30% opacity. A watermark, not a readout. On a narrow frame the wordmark drops and the logo stays.</p>
+
+<p><strong>Bottom right</strong> -- three readouts: frame rate, signal strength, and what the robot thinks its motors are doing. Also 30% <strong>at rest</strong>, but they come up to full the moment one of them matters:</p>
+
+<ul>
+<li>the robot is moving (<code>RIGHT 220/0</code>, blue)</li>
+<li>the signal is at or below -75 dBm (amber) -- the earliest honest warning that you are driving out of range, since the video outlasts the commands</li>
+<li>the dead man's switch has just fired (<code>TIMEOUT</code>, red, three seconds)</li>
+</ul>
+
+<p>That last one is the point of the whole row: the motion timeout used to stop the robot and explain itself only in an event log nobody reads mid-drive.</p>
+
+<p>The frame rate is measured on the robot, because a browser reports a multipart image as loaded once, on the first frame, and cannot count them. Signal is the station RSSI in normal Wi-Fi, and on the fallback AP it is how well the robot hears <em>your</em> device -- the number that actually matters there. Motion is drawn the instant you press or release a button and then corrected by the robot's own view, which is exactly how a lost command becomes visible.</p>
+
+<p>All of it rides the stream health check that already runs every three seconds. No extra requests.</p>
+
+<p><strong>Top left</strong> -- the stream status, when there is something to say. It is never dimmed; it is the one overlay that is asking you to do something.</p>
+
+<p>These are page elements beside the image, not pixels in it. So they stay upright at every display rotation, because rotation transforms the image alone, and anything that saves or records the stream directly gets clean frames. Burning a watermark into the video would mean decoding, drawing and re-encoding every frame on the ESP32, which would cost far more frame rate than the mark is worth.</p>
+
+<h3>Header</h3>
+
+<p>A sticky bar across the top: the logo, the robot name, and <code>workshop-diy.org</code> with the running firmware's build stamp beside it. On the right, three pills -- <strong>Settings</strong>, <strong>Debug</strong>, and a link indicator that reads <code>Live</code> (green), <code>No video</code> (amber) or <code>Offline</code> (red, pulsing) from the same health check.</p>
+
+<p>The sidebar toggles used to float in the top corners, on top of the video. The header sits above the sidebars deliberately, so the pill that opened one is still there to close it. On narrow screens the two toggle labels drop to icons; the link pill keeps its text.</p>
+
+<p>The logo is defined once as an SVG <code>symbol</code> and referenced by both the header and the watermark. Two inline copies would cost 3.5 KB twice.</p>
+
+<h3>Video stream behavior</h3>
+
+<ul>
+<li>Defaults are <strong>VGA at JPEG quality 12</strong> with two frame buffers when PSRAM is present, and <strong>QVGA</strong> when it is not. Quality 12 rather than 10 because the Wi-Fi link, not the sensor, sets the frame rate.</li>
+<li>The camera always hands over its <strong>newest</strong> frame. Queued frames would arrive a capture late, which looks like lag even when the frame rate is fine.</li>
+<li>Wi-Fi modem sleep is switched off. Left on, the radio parks between beacons and the picture stutters.</li>
+<li><strong>One viewer at a time.</strong> A second browser is told the stream is in use rather than being left with a picture that never arrives.</li>
+<li>The page <strong>reconnects on its own</strong>. If the stream drops or simply stops -- a failed capture and a reboot both end it without any error the browser can see -- the page notices within a few seconds and re-opens it. A short message in the corner of the video says what is happening.</li>
+<li>The stream <strong>pauses while its browser tab is hidden</strong>, so a forgotten tab does not hold the single viewer slot or spend radio time on frames nobody is watching. It resumes when the tab comes back.</li>
+<li>The debug sidebar shows the frame rate the robot is actually sending, and how many streams have ended since boot. A viewer coming and going is normal; a count that climbs on its own is a link that keeps dropping.</li>
+<li>Opening a stream is not logged. A stream that ends is, once, with how long it lasted -- a browser that keeps reconnecting would otherwise fill the 64-event history with pairs of lines and push out whatever caused it.</li>
+</ul>
+
+<p>The Settings sidebar provides:</p>
+
+<ul>
+<li>Resolution:</li>
+</ul>
+<p>  - QQVGA 160x120</p>
+<p>  - QVGA 320x240</p>
+<p>  - VGA 640x480</p>
+<p>  - SVGA 800x600</p>
+<p>  - XGA 1024x768</p>
+<p>  - SXGA 1280x1024</p>
+<p>  - UXGA 1600x1200</p>
+<ul>
+<li>Display rotation:</li>
+</ul>
+<p>  - 0 degrees</p>
+<p>  - 90 degrees clockwise</p>
+<p>  - 180 degrees</p>
+<p>  - 270 degrees clockwise</p>
+<ul>
+<li>JPEG quality</li>
+<li>Brightness</li>
+<li>Contrast</li>
+<li>Saturation</li>
+<li>Vertical flip</li>
+<li>Horizontal mirror</li>
+<li>Reset camera defaults</li>
+</ul>
+
+<p>High resolutions require PSRAM.</p>
+
+<h3>Rotation behavior</h3>
+
+<p>Vertical flip and horizontal mirror are sensor settings. They are applied by the camera.</p>
+
+<p>The 0/90/180/270 <strong>Display rotation</strong> setting rotates the stream in the browser. This avoids expensive real-time JPEG decoding, rotation, and re-encoding on the ESP32.</p>
+
+<p>The selected rotation is stored in the browser with <code>localStorage</code>, so it is remembered by that browser.</p>
+
+<h2>Web user interface</h2>
+
+<p>The robot page has two collapsible sidebars.</p>
+
+<h3>Left sidebar: Settings</h3>
+
+<p>Includes:</p>
+
+<ul>
+<li><strong>Camera</strong> -- the camera controls listed above</li>
+<li><strong>Robot</strong> -- name, speed limit, and the measured wake-up numbers</li>
+<li><strong>Wi-Fi</strong> -- scan for networks and join one</li>
+<li><strong>USB Serial console</strong> -- baud selector, select port / connect / disconnect, live UART capture terminal, auto-scroll, clear capture, save capture, command entry</li>
+<li><strong>Firmware update (OTA)</strong> -- build date/time of the running firmware, OTA password, .bin picker, upload with a progress bar</li>
+</ul>
+
+<p>Three collapsible sections. Camera is open on arrival; the other two stay shut until you want them.</p>
+
+<p>The split is by what you are doing: Settings is what you change on the robot, Debug is what you watch while driving it. The build stamp sits in the OTA card because it is what tells you an upload actually took -- upload, wait for the reboot, check the date changed.</p>
+
+<h3>Right sidebar: Robot Debug</h3>
+
+<p>Shows:</p>
+
+<ul>
+<li>Motion state</li>
+<li>Left/right target PWM</li>
+<li>Left/right current output PWM</li>
+<li>Network mode</li>
+<li>Station status</li>
+<li>SSID</li>
+<li>Robot IP</li>
+<li>AP clients</li>
+<li>Wi-Fi RSSI</li>
+<li>Uptime</li>
+<li>Stream frame rate, or "no viewer"</li>
+<li>Latest debug message</li>
+<li>64-event retained event history</li>
+<li>Export debug log</li>
+<li>Clear debug log</li>
+</ul>
+
+<p>Newest debug events are shown at the top.</p>
+
+<h2>Record and replay</h2>
+
+<p>The header has two views of the same column, <strong>Drive</strong> and <strong>Program</strong>. The video stays above both, so a program can be watched while it runs.</p>
+
+<p>Press <strong>Record</strong>, drive the robot by hand, press <strong>Stop</strong>. What you did is now a list of instructions in the Program view:</p>
+
+<pre><code>1   0.0s   Forward
+2   1.4s   Stop
+3   0.6s   Right
+4   0.5s   Stop</code></pre>
+
+<p>Press <strong>Play</strong> and the robot does it again. Change a pause, delete a line, play it again -- that is the whole point. A child drives first and reads their own program second, which is a gentler route into programming than starting from an empty editor.</p>
+
+<p>Three slots keep programs <strong>on the robot</strong>, not in the browser, so a program follows the robot round the classroom rather than the tablet that recorded it. The robot does not replay on its own yet -- a browser still has to press Play.</p>
+
+<h3>How it works, and why it is safe</h3>
+
+<p>Every command the page sends already passes through the same three functions, so a recording is just those calls with the pause before each one written down. Playback calls the same functions -- which means a replayed drive sends the same 250 ms keepalives a held button does, and is governed by the same 600 ms motion timeout. A program cannot drive the robot in a way a child could not.</p>
+
+<p>It stops on <strong>Stop</strong>, on leaving the page, on switching tabs, and on the window losing focus. A replay that is interrupted always sends a stop.</p>
+
+<p>Repeats are not recorded as steps: a held button repeats itself four times a second and a dragged slider fires continuously, and neither is a new instruction.</p>
+
+<h2>Photos</h2>
+
+<p><strong>Photo</strong> on the strip under the video grabs a single frame from <code>/capture</code> and adds it to <strong>Photos</strong>, where each one has a Save button. They live in the browser for the session only; saving is how one is kept. A few VGA stills would be most of a browser's storage quota, so they are deliberately not persisted.</p>
+
+<p><code>/capture</code> is served by the control server on port 80, so it answers while the stream server on 81 is busy, and it returns whatever the camera is seeing at that moment.</p>
+
+<h2>Find the wake-up number</h2>
+
+<p>Settings &rarr; Robot &rarr; <strong>Measure them</strong> starts a guided activity. It powers one wheel at a time, starting at 20 out of 255 and stepping up by 5, and asks whether the wheel is turning. When the child says it is, that number is the motor's starting threshold, and it is saved on the robot.</p>
+
+<p>The two motors will disagree, often by 20 or 30. That difference is the lesson: identical parts are not identical, and it is why the robot pulls to one side.</p>
+
+<p>The activity reuses the existing steering commands to run one wheel at a time: testing the left wheel uses the right-turn command, and testing the right wheel uses the left-turn command. The activity hides that detail. It also restores the driving speeds it found when it started, so a class does not end up wondering why the robot got slow.</p>
+
+<h2>Robot name and speed limit</h2>
+
+<p>Settings &rarr; Robot:</p>
+
+<ul>
+<li><strong>Name</strong> -- shown in the header and the browser tab, and used for photo and log filenames. Stored on the robot, so every browser sees the same name.</li>
+<li><strong>Speed limit</strong> -- a ceiling on motor PWM, enforced in the firmware rather than the browser, so it holds however the command arrives. The startup kick respects it too. Anything already above a new ceiling is brought down to it immediately.</li>
+</ul>
+
+<h2>Saved settings</h2>
+
+<p>Settings are split by who owns them.</p>
+
+<h3>On the robot, in flash</h3>
+
+<p>Camera resolution, JPEG quality, brightness, contrast, saturation, flip and mirror; motor speeds; LED brightness and on/off. These describe the robot, not your browser, so they live in NVS and come back after a power cycle.</p>
+
+<p>Putting them in the browser instead would break in two ways: a phone and a laptop would restore two different sets of values and overwrite each other, and a robot rebooted without the right browser open would come back on firmware defaults.</p>
+
+<p>Writes are <strong>held for four seconds after the last change</strong>. The camera and motor controls send on every slider movement, and committing to flash at that rate would be hundreds of writes for one drag.</p>
+
+<p>A resolution saved on a board with PSRAM is not restored onto a board without it; the allocation would fail and take the stream with it.</p>
+
+<h3>In the browser, in localStorage</h3>
+
+<p>Display rotation, serial baud, terminal auto-scroll, and which Settings sections are open. Per-viewer preferences the robot has no opinion about.</p>
+
+<p>The section state is saved when you click a section header, not when the <code>&lt;details&gt;</code> element toggles. Browsers reinstate <code>&lt;details&gt;</code> state from session history after the page loads, and saving on the toggle event would record the browser's restoration instead of your choice.</p>
+
+<h3>Never saved</h3>
+
+<p>The OTA password.</p>
+
+<h3>The page no longer overwrites the robot</h3>
+
+<p>The page used to send its own slider defaults to the robot on every load, so opening a second tab reset the motor speeds and the LED under whoever was driving. It now reads all three from the robot and adopts them, and never overwrites a control you have already touched in that session.</p>
+
+<h2>Editing the web UI</h2>
+
+<p>The whole browser UI is one raw string literal, <code>INDEX_HTML</code>, inside <code>wdi_esp32_cam_robot_m1.ino</code>, so the sketch still opens in the Arduino IDE with no extra steps.</p>
+
+<p>That literal is about 70 KB, and it travels over the same Wi-Fi link as the video. The firmware therefore serves a gzipped copy of it -- about 15 KB -- which is generated into <code>index_html_gz.h</code> by:</p>
+
+<pre><code>python tools/gzip_ui.py</code></pre>
+
+<p>Run that after changing the HTML, CSS, or JavaScript, and commit the generated header alongside the sketch.</p>
+
+<p>If you forget, nothing breaks: the firmware compares the length and hash of the literal it was built with against the ones recorded in the header, and falls back to serving the page uncompressed. The debug log says so at boot:</p>
+
+<p><code>WARN: UI gzip asset is stale; serving N bytes uncompressed. Re-run tools/gzip_ui.py</code></p>
+
+<h2>UART0 / USB serial console</h2>
+
+<p>ESP32-CAM UART0:</p>
+
+<ul>
+<li>Baud: <strong>115200</strong></li>
+<li>Data bits: 8</li>
+<li>Parity: none</li>
+<li>Stop bits: 1</li>
+</ul>
+
+<h3>Wiring</h3>
+
+<table>
+<tr><th>ESP32-CAM</th><th>USB-TTL adapter</th></tr>
+<tr><td>U0T / GPIO1</td><td>RX</td></tr>
+<tr><td>U0R / GPIO3</td><td>TX</td></tr>
+<tr><td>GND</td><td>GND</td></tr>
+</table>
+
+<p>Use a <strong>3.3V TTL-compatible</strong> serial adapter. Do not connect RS-232 voltage levels directly to the ESP32.</p>
+
+<p>The console accepts:</p>
+
+<ul>
+<li><code>help</code></li>
+<li><code>status</code></li>
+<li><code>log</code></li>
+<li><code>camera</code></li>
+<li><code>stop</code></li>
+</ul>
+
+<p><code>stop</code> performs an emergency motor stop.</p>
+
+<h3>Browser Web Serial limitation</h3>
+
+<p>Chrome/Edge Web Serial requires a secure context. A page opened directly from:</p>
+
+<p><code>http://192.168.x.x</code></p>
+
+<p>is normally not considered a secure context, so direct COM-port access may be blocked even though the robot UI itself works.</p>
+
+<p>A standalone helper is included:</p>
+
+<p><code>ESP32_Robot_USB_Serial_Console.html</code></p>
+
+<p>For reliable Web Serial access, serve it from localhost:</p>
+
+<pre><code>
+python -m http.server 8000
+
+</code></pre>
+
+<p>Then open:</p>
+
+<p><code>http://localhost:8000/ESP32_Robot_USB_Serial_Console.html</code></p>
+
+<p>in Chrome or Edge.</p>
+
+<h2>Choosing a network</h2>
+
+<p>The credentials in the sketch are only defaults, used the first time. A network picked in <strong>Settings &rarr; Wi-Fi</strong> is stored on the robot, so moving it between a workshop and a classroom no longer means reflashing it.</p>
+
+<ol>
+<li>Connect to the robot's fallback AP and open <code>192.168.4.1</code>.</li>
+<li>Settings &rarr; Wi-Fi &rarr; <strong>Scan for networks</strong>.</li>
+<li>Pick one from the list, type the password, <strong>Save and connect</strong>.</li>
+<li>The page watches for the outcome and reports the new address.</li>
+</ol>
+
+<p>The access point stays up throughout, including while the attempt is running and after it fails, so it is not possible to lock yourself out of the robot from the robot's own interface.</p>
+
+<p>Some things worth knowing:</p>
+
+<ul>
+<li><strong>A scan disturbs the video.</strong> The scan and the access point share one radio. That is why scanning is a button and never something on a timer, and why the robot <strong>refuses to scan while it is moving</strong> -- a scan blocks the control server for several seconds, which would starve the motion keepalive and trip the safety timeout mid-manoeuvre.</li>
+<li><strong>Joining a network may drop you briefly</strong>, because it moves the radio to that network's channel.</li>
+<li><strong>The password is stored in plain text</strong> and travels over the AP link. The AP is WPA2, but its passphrase is in this readme. Treat this as convenience, not security.</li>
+<li>The attempt runs from the main loop rather than inside the request, because the reply has to leave before the radio moves.</li>
+</ul>
+
+<h2>Wi-Fi behavior</h2>
+
+<p>At boot the robot:</p>
+
+<ol>
+<li>1. Tries the configured Wi-Fi network for 10 seconds.</li>
+<li>2. If successful, it runs in normal STA mode.</li>
+<li>3. If it cannot connect, it creates its own fallback access point.</li>
+<li>4. While fallback AP mode is active, it periodically retries the configured Wi-Fi.</li>
+</ol>
+
+<h3>Fallback AP</h3>
+
+<ul>
+<li>SSID: <code>ESP32-Robot-XXXX</code></li>
+<li>Password: <code>88888888</code></li>
+<li>Default AP address: <code>http://192.168.4.1</code></li>
+</ul>
+
+<p><code>XXXX</code> is generated from part of the ESP32 chip ID so several classroom robots can have different SSIDs.</p>
+
+<p>If normal Wi-Fi works, the robot is usually reached at the DHCP address shown in the debug sidebar or UART console.</p>
+
+<h3>Retries while the fallback AP is in use</h3>
+
+<p>The access point and the station share one radio and one channel, and the station is the one that picks it. Retrying the configured Wi-Fi therefore means a scan and an association that stalls AP traffic for a second or two, and can throw AP clients off outright -- it used to cut the video and swallow motor commands every 30 seconds while someone was driving.</p>
+
+<p>So while <strong>any client is connected to the fallback AP, the retries stop</strong>, and the log says so once:</p>
+
+<p><code>NET: Wi-Fi retry paused while the fallback AP is in use</code></p>
+
+<p>They resume when the last client disconnects. The consequence is worth knowing: if you stay connected to the fallback AP, the robot will not rejoin the configured network on its own. Disconnect for a minute, or reboot it, once the normal network is back.</p>
+
+<p>With nobody connected, retries <strong>back off</strong> from 30 seconds, doubling to a five-minute cap, and reset once the configured network is joined. Each attempt logs the interval for the next one.</p>
+
+<h2>Debug event system</h2>
+
+<p>The ESP32 keeps the newest <strong>64 events</strong> in a circular buffer.</p>
+
+<p>Examples:</p>
+
+<ul>
+<li>Boot started</li>
+<li>Camera initialized</li>
+<li>Wi-Fi connection state</li>
+<li>Fallback AP start</li>
+<li>Motor commands</li>
+<li>Motion timeout stops</li>
+<li>PWM changes</li>
+<li>Camera settings</li>
+<li>OTA start/success/failure</li>
+<li>Serial emergency stop</li>
+</ul>
+
+<p>The browser requests only events newer than the last event ID it has seen.</p>
+
+<p>This prevents fast button events from being lost between status polls.</p>
+
+<h2>Export debug log</h2>
+
+<p>The Debug sidebar can save a <code>.txt</code> file containing:</p>
+
+<ul>
+<li>Current robot state</li>
+<li>PWM targets and outputs</li>
+<li>Network state</li>
+<li>SSID/IP</li>
+<li>Wi-Fi RSSI</li>
+<li>Uptime</li>
+<li>Build timestamp</li>
+<li>Latest message</li>
+<li>Event history, newest first</li>
+</ul>
+
+<p>The export uses Windows-friendly CRLF line endings and UTF-8 text.</p>
+
+<h2>OTA firmware update</h2>
+
+<p>The Debug sidebar contains a browser OTA uploader.</p>
+
+<p>OTA password:</p>
+
+<p><code>88888888</code></p>
+
+<p>Before OTA works, the ESP32 must be flashed once by USB using an OTA-capable partition scheme.</p>
+
+<p>A suitable Arduino IDE choice is typically:</p>
+
+<p><code>Minimal SPIFFS (1.9MB APP with OTA / 190KB SPIFFS)</code></p>
+
+<p>Exact wording may vary with the ESP32 Arduino core version.</p>
+
+<h3>OTA workflow</h3>
+
+<ol>
+<li>1. Compile the current sketch in Arduino IDE.</li>
+<li>2. Use <strong>Sketch -&gt; Export Compiled Binary</strong>.</li>
+<li>3. Select the main application file:</li>
+</ol>
+<p>   - <code>YourSketch.ino.bin</code></p>
+<ol>
+<li>4. Do not select:</li>
+</ol>
+<p>   - <code>*.bootloader.bin</code></p>
+<p>   - <code>*.partitions.bin</code></p>
+<p>   - <code>*.merged.bin</code></p>
+<ol>
+<li>5. Open the robot Debug sidebar.</li>
+<li>6. Enter OTA password <code>88888888</code>.</li>
+<li>7. Select the application <code>.ino.bin</code>.</li>
+<li>8. Upload.</li>
+<li>9. Motors are stopped before firmware writing.</li>
+<li>10. After a successful update, the ESP32 reboots.</li>
+</ol>
+
+<h2>Arduino sketch folder rule</h2>
+
+<p>This is important.</p>
+
+<p>Arduino compiles <strong>every <code>.ino</code> file in the same sketch folder</strong>.</p>
+
+<p>Do not put multiple complete versions of this robot firmware in the same directory.</p>
+
+<p>Correct:</p>
+
+<pre><code>
+ESP32_Robot_Complete/
+
+  ESP32_Robot_Complete.ino
+
+</code></pre>
+
+<p>Incorrect:</p>
+
+<pre><code>
+ESP32_Robot_Complete/
+
+  ESP32_Robot_Complete.ino
+
+  old_robot.ino
+
+  test_robot.ino
+
+</code></pre>
+
+<p>The incorrect layout causes errors such as:</p>
+
+<ul>
+<li>redefinition of <code>ssid</code></li>
+<li>redefinition of <code>setup()</code></li>
+<li>redefinition of <code>loop()</code></li>
+<li>redefinition of camera handlers</li>
+<li>redefinition of OTA variables</li>
+</ul>
+
+<p>Keep old firmware versions in separate folders or rename them to <code>.txt</code>.</p>
+
+<h2>Recommended Arduino settings</h2>
+
+<p>Typical settings for AI-Thinker ESP32-CAM:</p>
+
+<ul>
+<li>Board: AI Thinker ESP32-CAM</li>
+<li>Upload speed: 115200 if higher speeds are unreliable</li>
+<li>CPU frequency: 240 MHz</li>
+<li>Flash frequency: 40 MHz</li>
+<li>OTA-capable partition scheme</li>
+<li>Correct COM port</li>
+</ul>
+
+<p>For USB flashing, GPIO0 normally needs to be held low during boot, depending on the programmer/adapter arrangement.</p>
+
+<h2>Upload troubleshooting</h2>
+
+<p>If flashing connects at low speed and then fails after switching to a high baud rate, reduce <strong>Upload Speed</strong> to 115200.</p>
+
+<p>Disconnect or stop motors during firmware upload and use a stable 5V supply.</p>
+
+<h2>Network troubleshooting</h2>
+
+<p>If the robot cannot join configured Wi-Fi:</p>
+
+<ul>
+<li>Check SSID spelling</li>
+<li>Check password</li>
+<li>Check 2.4 GHz availability</li>
+<li>Check signal level</li>
+<li>Check router/AP security compatibility</li>
+</ul>
+
+<p>The debug log reports status such as:</p>
+
+<ul>
+<li>connected</li>
+<li>SSID not found</li>
+<li>connection/authentication failed</li>
+<li>connection lost</li>
+<li>disconnected</li>
+</ul>
+
+<p>If STA mode fails, connect directly to the fallback <code>ESP32-Robot-XXXX</code> network and open <code>192.168.4.1</code>.</p>
+
+<h2>Camera troubleshooting</h2>
+
+<p>If higher resolutions fail:</p>
+
+<ul>
+<li>Confirm PSRAM is detected.</li>
+<li>Try VGA or QVGA.</li>
+<li>Increase JPEG quality number to reduce image size.</li>
+<li>Check power stability.</li>
+<li>Lower resolution if the camera stream becomes slow.</li>
+</ul>
+
+<p>Remember: a lower JPEG quality number means higher image quality and generally larger JPEG frames.</p>
+
+<h2>Security notes</h2>
+
+<p>The current educational configuration uses <code>88888888</code> for:</p>
+
+<ul>
+<li>Fallback AP password</li>
+<li>OTA password</li>
+</ul>
+
+<p>This is convenient for a workshop/classroom but should be changed for an untrusted environment.</p>
+
+<p>The robot control page is HTTP, not HTTPS.</p>
+
+<p>Anyone who can reach the robot network may be able to control the robot unless additional authentication is added.</p>
+
+<h2>Main files</h2>
+
+<ul>
+<li><code>ESP32_Robot_Complete.ino</code> - complete ESP32-CAM robot firmware</li>
+<li><code>ESP32_Robot_USB_Serial_Console.html</code> - standalone localhost Web Serial terminal</li>
+<li><code>README.md</code> - this documentation</li>
+<li><code>README.html</code> - browser-friendly version of the documentation</li>
+</ul>
+
+<h2>Suggested classroom experiments</h2>
+
+<ul>
+<li>Find the minimum PWM where each unloaded wheel starts.</li>
+<li>Compare the left and right starting thresholds.</li>
+<li>Enable Sync and compare straight-line behavior.</li>
+<li>Intentionally offset one motor by 1-10 PWM counts and observe steering.</li>
+<li>Compare camera quality versus streaming responsiveness.</li>
+<li>Compare Wi-Fi RSSI with stream smoothness.</li>
+<li>Compare motor behavior with wheels lifted versus robot on the floor.</li>
+<li>Add encoders/Hall sensors later and compare requested PWM with actual RPM.</li>
+</ul>
+
+<h2>Future extensions</h2>
+
+<p>Useful next steps:</p>
+
+<ul>
+<li>Left/right wheel encoders</li>
+<li>Live RPM</li>
+<li>Wheel linear speed in m/s</li>
+<li>Distance estimation</li>
+<li>Closed-loop speed control</li>
+<li>Battery voltage monitoring</li>
+<li>Add a reverse control to the web UI (the TB6612FNG hardware already supports it)</li>
+<li>Saved Wi-Fi configuration from the browser</li>
+<li>Authentication for robot controls</li>
+<li>Downloadable CSV experiment data</li>
+</ul>
+</main>
+</body>
+</html>

@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ESP32-CAM Robot USB Serial Console</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 24px; background: #f7f8fa; color: #172033; }
+    main { max-width: 900px; margin: 0 auto; }
+    .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    button, select, input { min-height: 42px; font-size: 16px; padding: 8px 10px; }
+    button { cursor: pointer; }
+    .status { margin: 12px 0; padding: 10px; border-radius: 8px; background: #eef2f7; }
+    .error { background: #fee2e2; color: #7f1d1d; }
+    .ok { background: #dcfce7; color: #14532d; }
+    pre { min-height: 420px; max-height: 60vh; overflow: auto; padding: 14px; border-radius: 10px; background: #070d18; color: #d1fae5; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .send { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    .port { margin: 10px 0; font-family: monospace; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>ESP32-CAM Robot USB Serial Console</h1>
+
+  <div id="status" class="status">Checking Web Serial...</div>
+
+  <div class="bar">
+    <select id="baud">
+      <option>9600</option>
+      <option>19200</option>
+      <option>38400</option>
+      <option>57600</option>
+      <option selected>115200</option>
+      <option>230400</option>
+      <option>460800</option>
+    </select>
+    <button id="select">Select port</button>
+    <button id="connect" disabled>Connect</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <label><input id="autoscroll" type="checkbox" checked> Auto-scroll</label>
+    <button id="clear">Clear</button>
+    <button id="save">Save capture</button>
+  </div>
+
+  <div class="port">Port: <span id="port">None selected</span></div>
+
+  <pre id="terminal"></pre>
+
+  <div class="send">
+    <input id="command" type="text" placeholder="help, status, log, camera, stop" autocomplete="off">
+    <button id="send" disabled>Send</button>
+  </div>
+
+  <p>ESP32 UART: 115200 8N1. Wire U0T/GPIO1 → USB-TTL RX, U0R/GPIO3 ← USB-TTL TX, and GND ↔ GND. Use 3.3V TTL signalling.</p>
+  <p>If Web Serial is unavailable when you double-click this file, serve its folder locally and open it with Chrome/Edge, for example: <code>python -m http.server 8000</code> then open <code>http://localhost:8000/ESP32_Robot_USB_Serial_Console.html</code>.</p>
+</main>
+<script>
+(() => {
+  const status = document.getElementById("status");
+  const baud = document.getElementById("baud");
+  const select = document.getElementById("select");
+  const connect = document.getElementById("connect");
+  const disconnect = document.getElementById("disconnect");
+  const autoscroll = document.getElementById("autoscroll");
+  const clear = document.getElementById("clear");
+  const save = document.getElementById("save");
+  const portLabel = document.getElementById("port");
+  const terminal = document.getElementById("terminal");
+  const command = document.getElementById("command");
+  const send = document.getElementById("send");
+
+  let port = null;
+  let reader = null;
+  let reading = false;
+  let capture = "";
+
+  function setStatus(message, cls="") {
+    status.textContent = message;
+    status.className = "status" + (cls ? " " + cls : "");
+  }
+
+  function append(s) {
+    capture += s;
+    if (capture.length > 1000000) capture = capture.slice(-750000);
+    terminal.textContent = capture;
+    if (autoscroll.checked) terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  function label(p) {
+    const info = p && p.getInfo ? p.getInfo() : {};
+    const out = [];
+    if (info.usbVendorId !== undefined) out.push("VID 0x" + info.usbVendorId.toString(16).padStart(4,"0").toUpperCase());
+    if (info.usbProductId !== undefined) out.push("PID 0x" + info.usbProductId.toString(16).padStart(4,"0").toUpperCase());
+    return out.length ? out.join(" · ") : "Selected serial port";
+  }
+
+  function buttons() {
+    const supported = "serial" in navigator;
+    const opened = !!(port && port.readable && port.writable);
+    select.disabled = !supported || opened;
+    connect.disabled = !supported || !port || opened;
+    disconnect.disabled = !opened;
+    send.disabled = !opened;
+    baud.disabled = opened;
+  }
+
+  async function readLoop() {
+    reading = true;
+    const decoder = new TextDecoder();
+    try {
+      reader = port.readable.getReader();
+      while (reading) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        if (value) append(decoder.decode(value, {stream:true}));
+      }
+      append(decoder.decode());
+    } catch (e) {
+      if (reading) append("\n[READ ERROR] " + e.message + "\n");
+    } finally {
+      if (reader) {
+        try { reader.releaseLock(); } catch {}
+      }
+      reader = null;
+      reading = false;
+    }
+  }
+
+  select.onclick = async () => {
+    try {
+      port = await navigator.serial.requestPort();
+      portLabel.textContent = label(port);
+      setStatus("Port selected. Click Connect.", "ok");
+    } catch (e) {
+      if (e.name !== "NotFoundError") setStatus("Port selection failed: " + e.message, "error");
+    }
+    buttons();
+  };
+
+  connect.onclick = async () => {
+    try {
+      await port.open({baudRate:Number(baud.value), dataBits:8, stopBits:1, parity:"none", flowControl:"none"});
+      capture = "";
+      terminal.textContent = "";
+      append("[SERIAL] Connected at " + baud.value + " baud\n");
+      setStatus("Connected and capturing.", "ok");
+      buttons();
+      readLoop();
+    } catch (e) {
+      setStatus("Open failed: " + e.message, "error");
+    }
+  };
+
+  disconnect.onclick = async () => {
+    reading = false;
+    if (reader) { try { await reader.cancel(); } catch {} }
+    if (port) { try { await port.close(); } catch {} }
+    append("\n[SERIAL] Disconnected\n");
+    setStatus("Disconnected.");
+    buttons();
+  };
+
+  clear.onclick = () => { capture = ""; terminal.textContent = ""; };
+
+  save.onclick = () => {
+    const now = new Date();
+    const stamp = now.getFullYear()
+      + String(now.getMonth()+1).padStart(2,"0")
+      + String(now.getDate()).padStart(2,"0") + "_"
+      + String(now.getHours()).padStart(2,"0")
+      + String(now.getMinutes()).padStart(2,"0")
+      + String(now.getSeconds()).padStart(2,"0");
+    const header = "ESP32-CAM Robot USB Serial Capture\r\nCaptured: " + now.toLocaleString()
+      + "\r\nBaud: " + baud.value + "\r\nPort: " + portLabel.textContent + "\r\n\r\n";
+    const blob = new Blob(["\uFEFF", header, capture.replace(/\r?\n/g,"\r\n")], {type:"text/plain;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "ESP32_Robot_USB_Serial_" + stamp + ".txt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  async function sendCommand() {
+    if (!port || !port.writable) return;
+    const value = command.value.trim();
+    if (!value) return;
+    const writer = port.writable.getWriter();
+    try {
+      await writer.write(new TextEncoder().encode(value + "\r\n"));
+      append("> " + value + "\n");
+      command.value = "";
+    } finally {
+      writer.releaseLock();
+    }
+  }
+
+  send.onclick = sendCommand;
+  command.onkeydown = e => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      sendCommand();
+    }
+  };
+
+  if (!("serial" in navigator)) {
+    setStatus(
+      window.isSecureContext
+        ? "Web Serial is unavailable in this browser. Use current Chrome or Edge."
+        : "Web Serial requires HTTPS or localhost. Serve this file on localhost in Chrome/Edge.",
+      "error"
+    );
+  } else {
+    setStatus("Web Serial ready. Select your USB-TTL adapter.", "ok");
+  }
+  buttons();
+})();
+</script>
+</body>
+</html>

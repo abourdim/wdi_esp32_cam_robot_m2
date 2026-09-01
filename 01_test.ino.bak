@@ -1,0 +1,4008 @@
+/*
+  ESP32-CAM Robot - ported to the uploaded TB6612FNG schematic
+
+  Hardware used by this code (TB6612FNG / SparkFun ROB-14450):
+    GPIO12 -> PWMA and PWMB (tied together in the schematic)
+    GPIO2  -> AIN1
+    GPIO13 -> AIN2
+    GPIO15 -> BIN1
+    GPIO14 -> BIN2
+    GPIO4  -> LED
+
+  IMPORTANT:
+  The schematic ties PWMA and PWMB together on GPIO12 and ties STBY high.
+  To retain independent left/right speed control, GPIO12 is held HIGH and
+  PWM is applied to each motor's IN1 input while IN2 is held LOW.
+  This backup sketch keeps the existing forward/left/right/stop UI; the
+  TB6612FNG hardware itself is capable of reverse.
+
+  Motor experimentation controls:
+    - Independent left and right motor sliders.
+    - Full PWM range: 0-255 for each motor.
+    - Optional motor sync checkbox.
+    - Exact -1 / +1 PWM adjustment buttons.
+    - Sliders update the motors live while driving.
+    - Short 255 PWM kick when a motor starts from zero.
+
+  Network fallback:
+    - Try configured Wi-Fi for 10 seconds.
+    - If unavailable, start ESP32-Robot-XXXX access point.
+    - Fallback AP password: 88888888
+    - Fallback page: http://192.168.4.1
+    - AP remains available while STA periodically retries normal Wi-Fi.
+
+  Browser OTA:
+    - OTA password: 88888888
+    - Upload an exported Arduino .bin from the debug sidebar.
+    - Motors are stopped before writing firmware.
+    - Requires an OTA-capable partition scheme flashed once by USB.
+
+  USB/UART0 serial console:
+    - 115200 baud, 8N1.
+    - ESP32 U0T / GPIO1 -> USB-TTL RX.
+    - ESP32 U0R / GPIO3 <- USB-TTL TX.
+    - Common GND. Use 3.3V TTL signalling, not RS-232 voltage levels.
+    - Commands: help, status, log, camera, stop.
+
+  Camera settings sidebar:
+    - Resolution, display rotation (0/90/180/270), JPEG quality,
+      brightness, contrast, saturation, vertical flip, horizontal mirror,
+      and reset-to-defaults.
+    - 90/270 rotation is browser-side to avoid expensive JPEG re-encoding.
+*/
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "Arduino.h"
+#include "fb_gfx.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_http_server.h"
+#include <Update.h>
+
+// Existing Wi-Fi configuration from your original sketch
+const char *ssid = "free_gazza";          // Set to your Wi-Fi name
+const char *password = "Safia080707";  // Set to your Wi-Fi passwords
+
+// Wi-Fi fallback configuration
+// If the configured Wi-Fi cannot be reached within 10 seconds, the robot
+// creates its own access point. Connect directly to it and open 192.168.4.1.
+static const char *FALLBACK_AP_PASSWORD = "88888888";
+static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
+static const uint32_t WIFI_RETRY_INTERVAL_MS = 30000;
+
+// Browser OTA firmware update
+// NOTE: The board must be flashed once by USB using an OTA-capable partition
+// scheme (for example "Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)").
+static const char *OTA_PASSWORD = "88888888";
+volatile bool otaInProgress = false;
+
+char fallbackApSsid[32] = "";
+bool fallbackApActive = false;
+unsigned long lastWiFiRetryMs = 0;
+wl_status_t previousStaStatus = WL_IDLE_STATUS;
+
+// Camera pins
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+
+// TB6612FNG / SparkFun ROB-14450 motor driver pins, matching the schematic.
+// PWMA and PWMB are physically tied together to GPIO12.
+#define TB6612_PWM_AB_PIN 12
+#define MOTOR_A_IN1_PIN 2
+#define MOTOR_A_IN2_PIN 13
+#define MOTOR_B_IN1_PIN 15
+#define MOTOR_B_IN2_PIN 14
+
+// Connector J6 / channel A = left motor; J7 / channel B = right motor.
+#define MOTOR_L_IN1_PIN MOTOR_A_IN1_PIN
+#define MOTOR_L_IN2_PIN MOTOR_A_IN2_PIN
+#define MOTOR_R_IN1_PIN MOTOR_B_IN1_PIN
+#define MOTOR_R_IN2_PIN MOTOR_B_IN2_PIN
+
+// LED pin
+#define LED_GPIO_NUM 4
+
+// Flash LED brightness control
+static const int LED_MIN_PWM = 0;
+static const int LED_MAX_PWM = 255;
+volatile int ledBrightness = 255;
+volatile bool ledEnabled = false;
+
+// UART0 / USB-TTL console pins
+#define SERIAL_RX_PIN 3   // U0R
+#define SERIAL_TX_PIN 1   // U0T
+static const uint32_t SERIAL_BAUD = 115200;
+
+// Camera orientation
+bool Video_Flip = false;
+bool cameraHasPsram = false;
+
+// Motor control
+// Full 8-bit PWM range is intentionally exposed for experimentation.
+static const int MIN_PWM = 0;
+static const int MAX_PWM = 255;
+static const int START_KICK_MS = 120;  // brief boost when starting a motor from rest
+
+volatile int leftMotorSpeed = 220;
+volatile int rightMotorSpeed = 220;
+
+int currentLeftPWM = 0;
+int currentRightPWM = 0;
+
+enum MotionState {
+  MOTION_STOPPED,
+  MOTION_FORWARD,
+  MOTION_LEFT,
+  MOTION_RIGHT
+};
+
+volatile MotionState motionState = MOTION_STOPPED;
+
+// Browser debug/status panel
+// Keep a short history on the ESP32 itself so quick button presses are not
+// lost between browser polls.
+#define DEBUG_EVENT_COUNT 64
+#define DEBUG_EVENT_TEXT_LEN 80
+
+struct DebugEvent {
+  uint32_t id;
+  uint32_t timeMs;
+  char message[DEBUG_EVENT_TEXT_LEN];
+};
+
+char lastDebugMessage[128] = "Robot started";
+DebugEvent debugEvents[DEBUG_EVENT_COUNT];
+uint8_t debugEventHead = 0;   // next slot to write
+uint8_t debugEventSize = 0;   // number of valid entries
+uint32_t debugEventSequence = 0;
+portMUX_TYPE debugMux = portMUX_INITIALIZER_UNLOCKED;
+
+static const char *motionName(MotionState state) {
+  switch (state) {
+    case MOTION_FORWARD: return "FORWARD";
+    case MOTION_LEFT:    return "LEFT";
+    case MOTION_RIGHT:   return "RIGHT";
+    case MOTION_STOPPED:
+    default:             return "STOPPED";
+  }
+}
+
+static void setDebugMessage(const char *message) {
+  uint32_t now = millis();
+
+  portENTER_CRITICAL(&debugMux);
+
+  strncpy(lastDebugMessage, message, sizeof(lastDebugMessage) - 1);
+  lastDebugMessage[sizeof(lastDebugMessage) - 1] = '\0';
+
+  DebugEvent &event = debugEvents[debugEventHead];
+  event.id = ++debugEventSequence;
+  event.timeMs = now;
+  strncpy(event.message, message, DEBUG_EVENT_TEXT_LEN - 1);
+  event.message[DEBUG_EVENT_TEXT_LEN - 1] = '\0';
+
+  debugEventHead = (debugEventHead + 1) % DEBUG_EVENT_COUNT;
+  if (debugEventSize < DEBUG_EVENT_COUNT) {
+    debugEventSize++;
+  }
+
+  portEXIT_CRITICAL(&debugMux);
+
+  Serial.println(message);
+}
+
+static const char *networkModeName() {
+  if (fallbackApActive) {
+    if (WiFi.status() == WL_CONNECTED) return "AP+STA";
+    return "AP";
+  }
+
+  if (WiFi.status() == WL_CONNECTED) return "STA";
+  return "OFFLINE";
+}
+
+static const char *wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:
+      return "idle / connecting";
+
+    case WL_NO_SSID_AVAIL:
+      return "SSID not found";
+
+    case WL_SCAN_COMPLETED:
+      return "scan completed";
+
+    case WL_CONNECTED:
+      return "connected";
+
+    case WL_CONNECT_FAILED:
+      return "connection/authentication failed";
+
+    case WL_CONNECTION_LOST:
+      return "connection lost";
+
+    case WL_DISCONNECTED:
+      return "disconnected";
+
+    default:
+      return "unknown";
+  }
+}
+
+static void logWiFiStatus(const char *prefix, wl_status_t status) {
+  char dbg[144];
+
+  snprintf(
+    dbg,
+    sizeof(dbg),
+    "%s: %s (code %d)",
+    prefix,
+    wifiStatusName(status),
+    (int)status
+  );
+
+  setDebugMessage(dbg);
+}
+
+static void makeFallbackApName() {
+  // Use the last 4 hex digits of the ESP32 eFuse MAC so multiple classroom
+  // robots get distinct SSIDs, for example ESP32-Robot-F8B4.
+  uint64_t chipId = ESP.getEfuseMac();
+  uint16_t suffix = (uint16_t)(chipId & 0xFFFF);
+
+  snprintf(
+    fallbackApSsid,
+    sizeof(fallbackApSsid),
+    "ESP32-Robot-%04X",
+    suffix
+  );
+}
+
+static bool startFallbackAccessPoint() {
+  makeFallbackApName();
+
+  // AP+STA keeps the robot directly reachable while the station interface
+  // continues trying to reach the configured school/home Wi-Fi.
+  WiFi.mode(WIFI_AP_STA);
+
+  bool ok = WiFi.softAP(fallbackApSsid, FALLBACK_AP_PASSWORD);
+  fallbackApActive = ok;
+
+  if (!ok) {
+    setDebugMessage("ERROR: Could not start fallback access point");
+    return false;
+  }
+
+  char dbg[128];
+
+  snprintf(
+    dbg,
+    sizeof(dbg),
+    "BOOT: Fallback AP started; SSID %s",
+    fallbackApSsid
+  );
+  setDebugMessage(dbg);
+
+  IPAddress apIp = WiFi.softAPIP();
+  snprintf(
+    dbg,
+    sizeof(dbg),
+    "BOOT: Fallback AP IP %u.%u.%u.%u",
+    apIp[0], apIp[1], apIp[2], apIp[3]
+  );
+  setDebugMessage(dbg);
+
+  // Re-start the station attempt after switching to AP+STA mode.
+  WiFi.begin(ssid, password);
+  lastWiFiRetryMs = millis();
+
+  return true;
+}
+
+static void serviceWiFiFallback() {
+  if (!fallbackApActive) return;
+
+  wl_status_t currentStatus = WiFi.status();
+
+  // Log only state changes so the event history remains readable.
+  if (currentStatus != previousStaStatus) {
+    if (currentStatus == WL_CONNECTED) {
+      IPAddress ip = WiFi.localIP();
+      char dbg[144];
+
+      snprintf(
+        dbg,
+        sizeof(dbg),
+        "NET: Configured Wi-Fi connected; IP %u.%u.%u.%u; fallback AP remains available",
+        ip[0], ip[1], ip[2], ip[3]
+      );
+      setDebugMessage(dbg);
+    } else {
+      if (previousStaStatus == WL_CONNECTED) {
+        setDebugMessage(
+          "NET: Configured Wi-Fi connection lost; fallback AP remains available"
+        );
+      }
+
+      logWiFiStatus("NET: Station status", currentStatus);
+    }
+
+    previousStaStatus = currentStatus;
+  }
+
+  // Periodically retry the configured Wi-Fi while preserving the AP.
+  if (currentStatus != WL_CONNECTED &&
+      millis() - lastWiFiRetryMs >= WIFI_RETRY_INTERVAL_MS) {
+    lastWiFiRetryMs = millis();
+
+    char dbg[160];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "NET: Retrying configured Wi-Fi; previous status: %s",
+      wifiStatusName(currentStatus)
+    );
+    setDebugMessage(dbg);
+
+    WiFi.reconnect();
+  }
+}
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char *_STREAM_CONTENT_TYPE =
+    "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *_STREAM_PART =
+    "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t camera_httpd = NULL;
+httpd_handle_t stream_httpd = NULL;
+
+void startCameraServer();
+
+static int clampMotorPWM(int value) {
+  if (value < MIN_PWM) return MIN_PWM;
+  if (value > MAX_PWM) return MAX_PWM;
+  return value;
+}
+
+static int clampLedPWM(int value) {
+  if (value < LED_MIN_PWM) return LED_MIN_PWM;
+  if (value > LED_MAX_PWM) return LED_MAX_PWM;
+  return value;
+}
+
+static void applyLedOutput() {
+  int output = ledEnabled ? clampLedPWM(ledBrightness) : 0;
+  analogWrite(LED_GPIO_NUM, output);
+}
+
+static void writeTb6612Forward(int in1Pin, int in2Pin, int pwm) {
+  pwm = clampMotorPWM(pwm);
+
+  // PWMA/PWMB are held HIGH globally. Drive forward by keeping IN2 LOW
+  // and applying PWM to IN1, which preserves independent motor speeds.
+  digitalWrite(in2Pin, LOW);
+  analogWrite(in1Pin, pwm);
+}
+
+static void writeMotors(int leftPWM, int rightPWM) {
+  leftPWM = clampMotorPWM(leftPWM);
+  rightPWM = clampMotorPWM(rightPWM);
+
+  // A motor that starts from zero gets a short full-power kick.
+  // The exact requested PWM (0..255) is applied immediately afterward.
+  bool kickLeft = (currentLeftPWM == 0 && leftPWM > 0);
+  bool kickRight = (currentRightPWM == 0 && rightPWM > 0);
+
+  if (kickLeft || kickRight) {
+    writeTb6612Forward(MOTOR_L_IN1_PIN, MOTOR_L_IN2_PIN,
+                       kickLeft ? MAX_PWM : leftPWM);
+    writeTb6612Forward(MOTOR_R_IN1_PIN, MOTOR_R_IN2_PIN,
+                       kickRight ? MAX_PWM : rightPWM);
+    delay(START_KICK_MS);
+  }
+
+  writeTb6612Forward(MOTOR_L_IN1_PIN, MOTOR_L_IN2_PIN, leftPWM);
+  writeTb6612Forward(MOTOR_R_IN1_PIN, MOTOR_R_IN2_PIN, rightPWM);
+
+  currentLeftPWM = leftPWM;
+  currentRightPWM = rightPWM;
+}
+
+static void stopMotors() {
+  // TB6612 stop state: both direction inputs LOW. Shared PWMA/PWMB remains HIGH.
+  analogWrite(MOTOR_L_IN1_PIN, 0);
+  digitalWrite(MOTOR_L_IN2_PIN, LOW);
+  analogWrite(MOTOR_R_IN1_PIN, 0);
+  digitalWrite(MOTOR_R_IN2_PIN, LOW);
+  currentLeftPWM = 0;
+  currentRightPWM = 0;
+}
+
+static void applyMotion() {
+  int leftNow = leftMotorSpeed;
+  int rightNow = rightMotorSpeed;
+
+  switch (motionState) {
+    case MOTION_FORWARD:
+      writeMotors(leftNow, rightNow);
+      break;
+
+    case MOTION_LEFT:
+      writeMotors(0, rightNow);
+      break;
+
+    case MOTION_RIGHT:
+      writeMotors(leftNow, 0);
+      break;
+
+    case MOTION_STOPPED:
+    default:
+      stopMotors();
+      break;
+  }
+}
+
+static void moveForward() {
+  motionState = MOTION_FORWARD;
+  applyMotion();
+}
+
+static void turnLeft() {
+  motionState = MOTION_LEFT;
+  applyMotion();
+}
+
+static void turnRight() {
+  motionState = MOTION_RIGHT;
+  applyMotion();
+}
+
+static void commandStop() {
+  motionState = MOTION_STOPPED;
+  stopMotors();
+}
+
+static const char *frameSizeName(framesize_t frameSize) {
+  switch (frameSize) {
+    case FRAMESIZE_QQVGA: return "QQVGA";
+    case FRAMESIZE_QVGA:  return "QVGA";
+    case FRAMESIZE_VGA:   return "VGA";
+    case FRAMESIZE_SVGA:  return "SVGA";
+    case FRAMESIZE_XGA:   return "XGA";
+    case FRAMESIZE_SXGA:  return "SXGA";
+    case FRAMESIZE_UXGA:  return "UXGA";
+    default:               return "UNKNOWN";
+  }
+}
+
+static bool parseFrameSize(const char *name, framesize_t *frameSize) {
+  if (!name || !frameSize) return false;
+
+  if (strcmp(name, "QQVGA") == 0) {
+    *frameSize = FRAMESIZE_QQVGA;
+  } else if (strcmp(name, "QVGA") == 0) {
+    *frameSize = FRAMESIZE_QVGA;
+  } else if (strcmp(name, "VGA") == 0) {
+    *frameSize = FRAMESIZE_VGA;
+  } else if (strcmp(name, "SVGA") == 0) {
+    *frameSize = FRAMESIZE_SVGA;
+  } else if (strcmp(name, "XGA") == 0) {
+    *frameSize = FRAMESIZE_XGA;
+  } else if (strcmp(name, "SXGA") == 0) {
+    *frameSize = FRAMESIZE_SXGA;
+  } else if (strcmp(name, "UXGA") == 0) {
+    *frameSize = FRAMESIZE_UXGA;
+  } else {
+    return false;
+  }
+
+  return true;
+}
+
+static bool frameSizeNeedsPsram(framesize_t frameSize) {
+  return frameSize == FRAMESIZE_SVGA ||
+         frameSize == FRAMESIZE_XGA ||
+         frameSize == FRAMESIZE_SXGA ||
+         frameSize == FRAMESIZE_UXGA;
+}
+
+static void printSerialCameraStatus() {
+  sensor_t *sensor = esp_camera_sensor_get();
+
+  if (!sensor) {
+    Serial.println("[CAMERA] Sensor unavailable");
+    return;
+  }
+
+  Serial.println("[CAMERA]");
+  Serial.printf("  resolution : %s\n", frameSizeName(sensor->status.framesize));
+  Serial.printf("  quality    : %u (lower = better JPEG quality)\n",
+                (unsigned int)sensor->status.quality);
+  Serial.printf("  brightness : %d\n", (int)sensor->status.brightness);
+  Serial.printf("  contrast   : %d\n", (int)sensor->status.contrast);
+  Serial.printf("  saturation : %d\n", (int)sensor->status.saturation);
+  Serial.printf("  vflip      : %u\n", (unsigned int)sensor->status.vflip);
+  Serial.printf("  hmirror    : %u\n", (unsigned int)sensor->status.hmirror);
+  Serial.printf("  PSRAM      : %s\n", cameraHasPsram ? "yes" : "no");
+}
+
+static void printSerialRobotStatus() {
+  Serial.println("[STATUS]");
+  Serial.printf("  motion       : %s\n", motionName(motionState));
+  Serial.printf("  left target  : %d / 255\n", leftMotorSpeed);
+  Serial.printf("  right target : %d / 255\n", rightMotorSpeed);
+  Serial.printf("  left output  : %d / 255\n", currentLeftPWM);
+  Serial.printf("  right output : %d / 255\n", currentRightPWM);
+  Serial.printf("  flash LED    : %s, brightness %d / 255\n",
+                ledEnabled ? "ON" : "OFF",
+                ledBrightness);
+  Serial.printf("  network mode : %s\n", networkModeName());
+  Serial.printf("  STA status   : %s\n", wifiStatusName(WiFi.status()));
+
+  if (WiFi.status() == WL_CONNECTED) {
+    IPAddress ip = WiFi.localIP();
+    Serial.printf(
+      "  STA IP       : %u.%u.%u.%u\n",
+      ip[0], ip[1], ip[2], ip[3]
+    );
+    Serial.printf("  RSSI         : %ld dBm\n", (long)WiFi.RSSI());
+  }
+
+  if (fallbackApActive) {
+    IPAddress apIp = WiFi.softAPIP();
+    Serial.printf("  AP SSID      : %s\n", fallbackApSsid);
+    Serial.printf(
+      "  AP IP        : %u.%u.%u.%u\n",
+      apIp[0], apIp[1], apIp[2], apIp[3]
+    );
+    Serial.printf(
+      "  AP clients   : %u\n",
+      (unsigned int)WiFi.softAPgetStationNum()
+    );
+  }
+
+  Serial.printf("  uptime       : %lu ms\n", (unsigned long)millis());
+}
+
+static void printSerialDebugHistory() {
+  uint8_t sizeCopy;
+  uint8_t headCopy;
+
+  portENTER_CRITICAL(&debugMux);
+  sizeCopy = debugEventSize;
+  headCopy = debugEventHead;
+  portEXIT_CRITICAL(&debugMux);
+
+  uint8_t oldest =
+    (headCopy + DEBUG_EVENT_COUNT - sizeCopy) % DEBUG_EVENT_COUNT;
+
+  Serial.printf("[LOG] %u retained event(s)\n", (unsigned int)sizeCopy);
+
+  for (uint8_t i = 0; i < sizeCopy; i++) {
+    uint8_t index = (oldest + i) % DEBUG_EVENT_COUNT;
+    DebugEvent eventCopy;
+
+    portENTER_CRITICAL(&debugMux);
+    eventCopy = debugEvents[index];
+    portEXIT_CRITICAL(&debugMux);
+
+    Serial.printf(
+      "  [%lu ms] #%lu %s\n",
+      (unsigned long)eventCopy.timeMs,
+      (unsigned long)eventCopy.id,
+      eventCopy.message
+    );
+  }
+}
+
+static void printSerialHelp() {
+  Serial.println();
+  Serial.println("ESP32-CAM Robot UART0 Console");
+  Serial.printf("UART0: %lu baud 8N1, RX=GPIO%d(U0R), TX=GPIO%d(U0T)\n",
+                (unsigned long)SERIAL_BAUD,
+                SERIAL_RX_PIN,
+                SERIAL_TX_PIN);
+  Serial.println("Commands:");
+  Serial.println("  help    - show this command list");
+  Serial.println("  status  - robot/motor/network status");
+  Serial.println("  log     - dump retained debug event history");
+  Serial.println("  camera  - current camera settings");
+  Serial.println("  stop    - emergency motor stop");
+  Serial.println();
+}
+
+static char serialCommandBuffer[96];
+static size_t serialCommandLength = 0;
+
+static void handleSerialCommand(char *command) {
+  if (!command) return;
+
+  while (*command == ' ' || *command == '\t') command++;
+
+  for (char *p = command; *p; ++p) {
+    if (*p >= 'A' && *p <= 'Z') {
+      *p = (char)(*p - 'A' + 'a');
+    }
+  }
+
+  if (strcmp(command, "") == 0) {
+    return;
+  }
+
+  if (strcmp(command, "help") == 0 || strcmp(command, "?") == 0) {
+    printSerialHelp();
+  } else if (strcmp(command, "status") == 0) {
+    printSerialRobotStatus();
+  } else if (strcmp(command, "log") == 0) {
+    printSerialDebugHistory();
+  } else if (strcmp(command, "camera") == 0) {
+    printSerialCameraStatus();
+  } else if (strcmp(command, "stop") == 0) {
+    commandStop();
+    setDebugMessage("SERIAL: Emergency STOP");
+  } else {
+    Serial.printf(
+      "Unknown command: %s. Type 'help'.\n",
+      command
+    );
+  }
+}
+
+static void serviceSerialConsole() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+
+    if (c == '\r' || c == '\n') {
+      if (serialCommandLength > 0) {
+        serialCommandBuffer[serialCommandLength] = '\0';
+        handleSerialCommand(serialCommandBuffer);
+        serialCommandLength = 0;
+      }
+      continue;
+    }
+
+    if (c == 8 || c == 127) {
+      if (serialCommandLength > 0) {
+        serialCommandLength--;
+      }
+      continue;
+    }
+
+    if (c >= 32 && c <= 126 &&
+        serialCommandLength < sizeof(serialCommandBuffer) - 1) {
+      serialCommandBuffer[serialCommandLength++] = c;
+    }
+  }
+}
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  pinMode(TB6612_PWM_AB_PIN, OUTPUT);
+  pinMode(MOTOR_L_IN1_PIN, OUTPUT);
+  pinMode(MOTOR_L_IN2_PIN, OUTPUT);
+  pinMode(MOTOR_R_IN1_PIN, OUTPUT);
+  pinMode(MOTOR_R_IN2_PIN, OUTPUT);
+  pinMode(LED_GPIO_NUM, OUTPUT);
+
+  // The schematic ties PWMA and PWMB to GPIO12 and STBY directly to +5V.
+  // Keep both bridge channels enabled and generate per-motor PWM on IN1.
+  digitalWrite(TB6612_PWM_AB_PIN, HIGH);
+
+  stopMotors();
+  ledEnabled = false;
+  ledBrightness = 255;
+  applyLedOutput();
+
+  Serial.begin(SERIAL_BAUD, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
+  Serial.setDebugOutput(false);
+  delay(50);
+  printSerialHelp();
+
+  // Startup events are stored in the same Wi-Fi debug history as runtime events.
+  setDebugMessage("BOOT: ESP32-CAM startup");
+  setDebugMessage("BOOT: UI features = motor sync, UART console, camera settings");
+  setDebugMessage("BOOT: Motor outputs initialized and stopped");
+  setDebugMessage("BOOT: Flash LED initialized OFF; brightness 255 / 255");
+
+  // Camera configuration
+  setDebugMessage("BOOT: Configuring camera");
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  cameraHasPsram = psramFound();
+
+  if (cameraHasPsram) {
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+    setDebugMessage("BOOT: PSRAM detected; camera VGA / 2 frame buffers");
+  } else {
+    config.frame_size = FRAMESIZE_HVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+    setDebugMessage("BOOT: No PSRAM; camera HVGA / 1 frame buffer");
+  }
+
+  setDebugMessage("BOOT: Initializing camera");
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg), "ERROR: Camera init failed: 0x%x", err);
+    setDebugMessage(dbg);
+    return;
+  }
+
+  setDebugMessage("BOOT: Camera initialized OK");
+
+  if (Video_Flip) {
+    sensor_t *s = esp_camera_sensor_get();
+    s->set_vflip(s, 1);
+    s->set_hmirror(s, 0);
+    setDebugMessage("BOOT: Camera vertical flip enabled");
+  } else {
+    setDebugMessage("BOOT: Camera orientation normal");
+  }
+
+  setDebugMessage("BOOT: Connecting to configured Wi-Fi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  unsigned long wifiStart = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    char wifiDbg[128];
+    IPAddress ip = WiFi.localIP();
+
+    snprintf(
+      wifiDbg,
+      sizeof(wifiDbg),
+      "BOOT: Wi-Fi connected; IP %u.%u.%u.%u",
+      ip[0], ip[1], ip[2], ip[3]
+    );
+    setDebugMessage(wifiDbg);
+
+    snprintf(
+      wifiDbg,
+      sizeof(wifiDbg),
+      "BOOT: Wi-Fi RSSI %ld dBm",
+      (long)WiFi.RSSI()
+    );
+    setDebugMessage(wifiDbg);
+
+    Serial.print("Robot Ready! Open: http://");
+    Serial.println(ip);
+
+    previousStaStatus = WL_CONNECTED;
+  } else {
+    wl_status_t failedStatus = WiFi.status();
+
+    char wifiDbg[160];
+    snprintf(
+      wifiDbg,
+      sizeof(wifiDbg),
+      "BOOT: Wi-Fi timeout after 10 seconds; status: %s (code %d)",
+      wifiStatusName(failedStatus),
+      (int)failedStatus
+    );
+    setDebugMessage(wifiDbg);
+
+    if (failedStatus == WL_NO_SSID_AVAIL) {
+      setDebugMessage("BOOT: Configured Wi-Fi SSID was not found");
+    } else if (failedStatus == WL_CONNECT_FAILED) {
+      setDebugMessage(
+        "BOOT: Wi-Fi connection/authentication failed; check password and security settings"
+      );
+    } else if (failedStatus == WL_CONNECTION_LOST) {
+      setDebugMessage("BOOT: Wi-Fi connection was lost before startup completed");
+    } else if (failedStatus == WL_DISCONNECTED) {
+      setDebugMessage(
+        "BOOT: Wi-Fi remained disconnected; SSID, password, signal, or AP compatibility may be the cause"
+      );
+    }
+
+    setDebugMessage("BOOT: Starting fallback access point");
+
+    if (startFallbackAccessPoint()) {
+      IPAddress apIp = WiFi.softAPIP();
+
+      Serial.println();
+      Serial.println("Configured Wi-Fi unavailable.");
+      Serial.print("Fallback SSID: ");
+      Serial.println(fallbackApSsid);
+      Serial.println("Fallback password: 88888888");
+      Serial.print("Open: http://");
+      Serial.println(apIp);
+    }
+
+    previousStaStatus = WiFi.status();
+  }
+
+  setDebugMessage("BOOT: Starting HTTP and camera-stream servers");
+  startCameraServer();
+  setDebugMessage("BOOT: Robot web server ready");
+}
+
+void loop() {
+  serviceSerialConsole();
+
+  if (!otaInProgress) {
+    serviceWiFiFallback();
+  }
+
+  delay(10);
+}
+
+static const char PROGMEM INDEX_HTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32-CAM Robot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8"/>
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      margin: 0;
+      padding: 18px 12px 35px;
+      background: #f7f8fa;
+      color: #172033;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(25px, 5vw, 38px);
+    }
+
+    .robot {
+      width: min(620px, 100%);
+      margin: 0 auto;
+    }
+
+    .video-frame {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      overflow: hidden;
+      border: 2px solid #2f4468;
+      border-radius: 12px;
+      background: #111;
+      transition: aspect-ratio 0.18s ease;
+    }
+
+    #photo {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      display: block;
+      max-width: none;
+      max-height: none;
+      transform-origin: center center;
+      background: #111;
+    }
+
+    .panel {
+      width: min(390px, 100%);
+      margin: 16px auto 0;
+      padding: 16px;
+      background: white;
+      border: 1px solid #d7dce5;
+      border-radius: 16px;
+    }
+
+    .speed-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }
+
+    .speed-value {
+      color: #2f4468;
+      white-space: nowrap;
+    }
+
+    .motor-control {
+      padding: 10px 0;
+    }
+
+    .motor-control + .motor-control {
+      border-top: 1px solid #e4e7ec;
+      margin-top: 8px;
+    }
+
+    .motor-slider {
+      width: 100%;
+      min-width: 0;
+      accent-color: #2f4468;
+      cursor: pointer;
+    }
+
+    .motor-adjust {
+      display: grid;
+      grid-template-columns: 50px minmax(0, 1fr) 50px;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .pwm-step {
+      min-height: 42px;
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      background: #f8fafc;
+      color: #172033;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .ui-version {
+      margin-bottom: 10px;
+      color: #667085;
+      font-size: 11px;
+      text-align: center;
+      letter-spacing: 0.02em;
+    }
+
+    .sync-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+      padding: 10px 0 12px;
+      border-bottom: 1px solid #e4e7ec;
+    }
+
+    .sync-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .sync-control input {
+      width: 20px;
+      height: 20px;
+      accent-color: #2f4468;
+    }
+
+    .sync-note {
+      color: #667085;
+      font-size: 12px;
+      text-align: right;
+    }
+
+    .speed-scale {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #667085;
+      margin-top: 3px;
+    }
+
+    .button-container {
+      display: grid;
+      grid-template-columns: repeat(3, 82px);
+      grid-template-areas:
+        ". forward led"
+        "left stop right"
+        ". backward .";
+      gap: 10px;
+      justify-content: center;
+      margin-top: 18px;
+    }
+
+    button {
+      touch-action: manipulation;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    .button, .led-button {
+      border: 0;
+      color: white;
+      font-size: 22px;
+      width: 82px;
+      height: 58px;
+      border-radius: 13px;
+      cursor: pointer;
+      background: #2f4468;
+    }
+
+    .button:active {
+      transform: scale(0.97);
+    }
+
+    .forward { grid-area: forward; }
+    .left { grid-area: left; }
+    .stop { grid-area: stop; }
+    .right { grid-area: right; }
+    .backward { grid-area: backward; }
+    .led { grid-area: led; }
+
+    .stop {
+      background: #9b2c2c;
+    }
+
+    .led-button {
+      font-size: 16px;
+      background: #777;
+    }
+
+    .led-on {
+      background: #e9b900;
+      color: #111;
+    }
+
+    .backward {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+
+    .note {
+      margin: 14px 0 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: #fff5d8;
+      color: #604b08;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .settings-toggle {
+      position: fixed;
+      top: 14px;
+      left: 14px;
+      z-index: 1100;
+      min-width: 48px;
+      height: 44px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 12px;
+      background: #172033;
+      color: white;
+      font-size: 20px;
+      cursor: pointer;
+    }
+
+    .settings-sidebar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      z-index: 1050;
+      width: min(360px, 90vw);
+      height: 100vh;
+      padding: 72px 16px 18px;
+      background: #f8fafc;
+      color: #172033;
+      box-shadow: 8px 0 24px rgba(0,0,0,0.22);
+      transform: translateX(-100%);
+      transition: transform 0.22s ease;
+      overflow-y: auto;
+      text-align: left;
+    }
+
+    .settings-sidebar.open {
+      transform: translateX(0);
+    }
+
+    .settings-sidebar h2 {
+      margin: 0 0 14px;
+      font-size: 21px;
+    }
+
+    .settings-section {
+      margin-top: 14px;
+      padding: 14px;
+      border: 1px solid #d7dce5;
+      border-radius: 14px;
+      background: white;
+    }
+
+    .settings-section h3 {
+      margin: 0 0 12px;
+      font-size: 16px;
+    }
+
+    .setting-row {
+      margin-top: 12px;
+    }
+
+    .setting-row:first-of-type {
+      margin-top: 0;
+    }
+
+    .setting-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 5px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .setting-value {
+      font-family: monospace;
+      color: #475569;
+    }
+
+    .camera-select,
+    .camera-range {
+      width: 100%;
+    }
+
+    .camera-select {
+      min-height: 42px;
+      border: 1px solid #cbd5e1;
+      border-radius: 9px;
+      background: white;
+      padding: 7px 9px;
+      color: #172033;
+      font-size: 16px;
+    }
+
+    .camera-check {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 40px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .camera-check input {
+      width: 20px;
+      height: 20px;
+    }
+
+    .settings-action {
+      width: 100%;
+      min-height: 42px;
+      margin-top: 12px;
+      border: 1px solid #94a3b8;
+      border-radius: 9px;
+      background: #f8fafc;
+      color: #172033;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .camera-status {
+      margin-top: 10px;
+      min-height: 42px;
+      padding: 9px 10px;
+      border-radius: 9px;
+      background: #eef2f7;
+      color: #475569;
+      font-family: monospace;
+      font-size: 12px;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
+
+    .serial-web-status {
+      margin-bottom: 10px;
+      padding: 9px 10px;
+      border-radius: 9px;
+      background: #eef2f7;
+      color: #475569;
+      font-size: 12px;
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
+
+    .serial-web-status.ok {
+      background: #dcfce7;
+      color: #14532d;
+    }
+
+    .serial-web-status.error {
+      background: #fee2e2;
+      color: #7f1d1d;
+    }
+
+    .serial-toolbar {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+    }
+
+    .serial-inline-button {
+      margin-top: 0;
+    }
+
+    .serial-port-info {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 9px;
+      background: #eef2f7;
+      font-size: 12px;
+    }
+
+    .serial-port-info span {
+      color: #64748b;
+    }
+
+    .serial-port-info strong {
+      max-width: 65%;
+      font-family: monospace;
+      text-align: right;
+      overflow-wrap: anywhere;
+    }
+
+    .serial-capture-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .serial-autoscroll {
+      margin-right: auto;
+      min-height: 34px;
+      font-size: 12px;
+    }
+
+    .serial-terminal {
+      width: 100%;
+      height: 230px;
+      margin: 9px 0 0;
+      padding: 10px;
+      overflow: auto;
+      border-radius: 10px;
+      background: #070d18;
+      color: #d1fae5;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .serial-send-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 7px;
+      margin-top: 8px;
+    }
+
+    .serial-send-button {
+      width: auto;
+      min-width: 70px;
+      margin-top: 0;
+    }
+
+    .serial-info {
+      margin: 12px 0 0;
+      padding-left: 19px;
+      color: #475569;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .serial-commands {
+      margin-top: 10px;
+      padding: 9px 10px;
+      border-radius: 9px;
+      background: #111827;
+      color: #e5e7eb;
+      font-family: monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .debug-toggle {
+      position: fixed;
+      top: 14px;
+      right: 14px;
+      z-index: 1100;
+      min-width: 48px;
+      height: 44px;
+      padding: 0 12px;
+      border: 0;
+      border-radius: 12px;
+      background: #172033;
+      color: white;
+      font-size: 20px;
+      cursor: pointer;
+    }
+
+    .debug-sidebar {
+      position: fixed;
+      top: 0;
+      right: 0;
+      z-index: 1050;
+      width: min(340px, 88vw);
+      height: 100vh;
+      padding: 72px 16px 18px;
+      background: #111827;
+      color: #f9fafb;
+      box-shadow: -8px 0 24px rgba(0,0,0,0.22);
+      transform: translateX(100%);
+      transition: transform 0.22s ease;
+      overflow-y: auto;
+      text-align: left;
+    }
+
+    .debug-sidebar.open {
+      transform: translateX(0);
+    }
+
+    .debug-sidebar h2 {
+      margin: 0 0 14px;
+      font-size: 21px;
+    }
+
+    .debug-grid {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px 14px;
+      padding: 12px;
+      border-radius: 12px;
+      background: #1f2937;
+      font-size: 14px;
+    }
+
+    .debug-grid .label { color: #cbd5e1; }
+    .debug-grid .value { font-family: monospace; font-weight: 700; }
+
+    .debug-message {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 12px;
+      background: #0b1220;
+      font-family: monospace;
+      font-size: 13px;
+      line-height: 1.45;
+      min-height: 70px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .debug-small {
+      margin-top: 10px;
+      color: #94a3b8;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .debug-status-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .debug-connection {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: #374151;
+      color: #e5e7eb;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .debug-connection.live {
+      background: #14532d;
+      color: #dcfce7;
+    }
+
+    .debug-connection.error {
+      background: #7f1d1d;
+      color: #fee2e2;
+    }
+
+    .debug-log-actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 6px;
+    }
+
+    .debug-clear {
+      min-height: 34px;
+      padding: 5px 10px;
+      border: 1px solid #475569;
+      border-radius: 8px;
+      background: #1f2937;
+      color: #f8fafc;
+      cursor: pointer;
+    }
+
+    .ota-panel {
+      padding: 12px;
+      border-radius: 12px;
+      background: #0b1220;
+    }
+
+    .ota-build {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+      font-size: 13px;
+    }
+
+    .ota-build span {
+      color: #94a3b8;
+    }
+
+    .ota-label,
+    .ota-file-label {
+      display: block;
+      margin: 9px 0 5px;
+      color: #cbd5e1;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .ota-input,
+    .ota-file {
+      width: 100%;
+      min-height: 40px;
+      border: 1px solid #475569;
+      border-radius: 8px;
+      background: #111827;
+      color: #f8fafc;
+      padding: 8px 9px;
+      font-size: 16px;
+    }
+
+    .ota-file {
+      padding: 7px;
+      font-size: 13px;
+    }
+
+    .ota-upload {
+      width: 100%;
+      min-height: 42px;
+      margin-top: 10px;
+      border: 0;
+      border-radius: 9px;
+      background: #334155;
+      color: #f8fafc;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .ota-upload:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .ota-progress-shell {
+      width: 100%;
+      height: 10px;
+      margin-top: 10px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #1f2937;
+    }
+
+    .ota-progress-bar {
+      width: 0%;
+      height: 100%;
+      background: #cbd5e1;
+      transition: width 0.12s linear;
+    }
+
+    .ota-progress-text {
+      margin-top: 7px;
+      color: #cbd5e1;
+      font-family: monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .ota-warning {
+      margin-top: 9px;
+      color: #fbbf24;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    .debug-log-title {
+      margin-top: 14px;
+      margin-bottom: 6px;
+      color: #cbd5e1;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .debug-log {
+      min-height: 110px;
+      max-height: 230px;
+      overflow-y: auto;
+      padding: 10px;
+      border-radius: 12px;
+      background: #070d18;
+      color: #d1d5db;
+      font-family: monospace;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .debug-log-entry {
+      padding: 3px 0;
+      border-bottom: 1px solid #172033;
+      overflow-wrap: anywhere;
+    }
+
+    .debug-log-entry:last-child {
+      border-bottom: 0;
+    }
+
+    @media (max-width: 420px) {
+      .button-container {
+        grid-template-columns: repeat(3, 76px);
+      }
+
+      .button, .led-button {
+        width: 76px;
+        height: 56px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <button id="settingsToggle" class="settings-toggle" type="button"
+          aria-controls="settingsSidebar" aria-expanded="false"
+          title="Open settings">⚙</button>
+
+  <aside id="settingsSidebar" class="settings-sidebar" aria-label="Settings sidebar">
+    <h2>Settings</h2>
+
+    <section class="settings-section">
+      <h3>Camera</h3>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <label for="cameraResolution">Resolution</label>
+        </div>
+        <select id="cameraResolution" class="camera-select">
+          <option value="QQVGA">QQVGA — 160×120</option>
+          <option value="QVGA">QVGA — 320×240</option>
+          <option value="VGA" selected>VGA — 640×480</option>
+          <option value="SVGA" data-psram="1">SVGA — 800×600</option>
+          <option value="XGA" data-psram="1">XGA — 1024×768</option>
+          <option value="SXGA" data-psram="1">SXGA — 1280×1024</option>
+          <option value="UXGA" data-psram="1">UXGA — 1600×1200</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <label for="cameraRotation">Display rotation</label>
+        </div>
+        <select id="cameraRotation" class="camera-select">
+          <option value="0">0° — normal</option>
+          <option value="90">90° clockwise</option>
+          <option value="180">180°</option>
+          <option value="270">270° clockwise</option>
+        </select>
+        <div class="debug-small">
+          Rotation is applied in the browser display. Vertical flip and
+          horizontal mirror are still applied by the camera sensor.
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <label for="cameraQuality">JPEG quality</label>
+          <span id="cameraQualityValue" class="setting-value">10</span>
+        </div>
+        <input id="cameraQuality" class="camera-range"
+               type="range" min="4" max="63" step="1" value="10">
+        <div class="debug-small">Lower number = better image / larger JPEG.</div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <label for="cameraBrightness">Brightness</label>
+          <span id="cameraBrightnessValue" class="setting-value">0</span>
+        </div>
+        <input id="cameraBrightness" class="camera-range"
+               type="range" min="-2" max="2" step="1" value="0">
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <label for="cameraContrast">Contrast</label>
+          <span id="cameraContrastValue" class="setting-value">0</span>
+        </div>
+        <input id="cameraContrast" class="camera-range"
+               type="range" min="-2" max="2" step="1" value="0">
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <label for="cameraSaturation">Saturation</label>
+          <span id="cameraSaturationValue" class="setting-value">0</span>
+        </div>
+        <input id="cameraSaturation" class="camera-range"
+               type="range" min="-2" max="2" step="1" value="0">
+      </div>
+
+      <label class="camera-check">
+        <input id="cameraVFlip" type="checkbox">
+        Vertical flip
+      </label>
+
+      <label class="camera-check">
+        <input id="cameraHMirror" type="checkbox">
+        Horizontal mirror
+      </label>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <label for="ledBrightnessSlider">Flash LED brightness</label>
+          <span id="ledBrightnessValue" class="setting-value">255 / 255 (100%)</span>
+        </div>
+        <input id="ledBrightnessSlider" class="camera-range"
+               type="range" min="0" max="255" step="1" value="255">
+        <div class="debug-small">
+          Sets GPIO4 flash LED intensity. The OFF/ON button on the robot controls
+          whether this brightness is applied.
+        </div>
+      </div>
+
+      <button id="cameraReset" class="settings-action" type="button">
+        Reset camera defaults
+      </button>
+
+      <div id="cameraStatus" class="camera-status">
+        Open Settings to read camera status.
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <h3>USB Serial console</h3>
+
+      <div id="webSerialSupport" class="serial-web-status">
+        Checking browser serial support...
+      </div>
+
+      <div class="serial-toolbar">
+        <select id="serialBaud" class="camera-select" aria-label="Serial baud rate">
+          <option value="9600">9600</option>
+          <option value="19200">19200</option>
+          <option value="38400">38400</option>
+          <option value="57600">57600</option>
+          <option value="115200" selected>115200</option>
+          <option value="230400">230400</option>
+          <option value="460800">460800</option>
+        </select>
+
+        <button id="serialSelectPort" class="settings-action serial-inline-button" type="button">
+          Select port
+        </button>
+
+        <button id="serialConnect" class="settings-action serial-inline-button" type="button" disabled>
+          Connect
+        </button>
+
+        <button id="serialDisconnect" class="settings-action serial-inline-button" type="button" disabled>
+          Disconnect
+        </button>
+      </div>
+
+      <div class="serial-port-info">
+        <span>Port</span>
+        <strong id="serialPortLabel">None selected</strong>
+      </div>
+
+      <div class="serial-capture-actions">
+        <label class="camera-check serial-autoscroll">
+          <input id="serialAutoScroll" type="checkbox" checked>
+          Auto-scroll
+        </label>
+
+        <button id="serialClear" class="debug-clear" type="button">Clear</button>
+        <button id="serialSave" class="debug-clear" type="button">Save capture</button>
+      </div>
+
+      <pre id="serialTerminal" class="serial-terminal" aria-live="polite"></pre>
+
+      <div class="serial-send-row">
+        <input
+          id="serialCommandInput"
+          class="ota-input"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="help, status, log, camera, stop">
+        <button id="serialSend" class="settings-action serial-send-button" type="button" disabled>
+          Send
+        </button>
+      </div>
+
+      <ul class="serial-info">
+        <li>ESP32 UART: 115200 baud, 8N1</li>
+        <li>U0T / GPIO1 → USB-TTL RX</li>
+        <li>U0R / GPIO3 ← USB-TTL TX</li>
+        <li>Connect GND ↔ GND</li>
+        <li>Use a 3.3V TTL serial adapter.</li>
+      </ul>
+
+      <div class="serial-commands">
+        Commands: help · status · log · camera · stop
+      </div>
+
+      <div class="debug-small">
+        Direct COM-port access uses the browser Web Serial API. Chrome/Edge
+        require a secure page (HTTPS or localhost), so it may be unavailable
+        when this robot page is opened directly from a LAN IP address.
+      </div>
+    </section>
+  </aside>
+
+  <button id="debugToggle" class="debug-toggle" type="button"
+          aria-controls="debugSidebar" aria-expanded="false"
+          title="Open debug sidebar">☰</button>
+
+  <aside id="debugSidebar" class="debug-sidebar" aria-label="Debug sidebar">
+    <h2>Robot Debug</h2>
+
+    <div class="debug-grid">
+      <span class="label">Motion</span><span id="dbgMotion" class="value">--</span>
+      <span class="label">Left target</span><span id="dbgLeftTarget" class="value">--</span>
+      <span class="label">Right target</span><span id="dbgRightTarget" class="value">--</span>
+      <span class="label">Left output</span><span id="dbgLeftOutput" class="value">--</span>
+      <span class="label">Right output</span><span id="dbgRightOutput" class="value">--</span>
+      <span class="label">Flash LED</span><span id="dbgLed" class="value">--</span>
+      <span class="label">Network mode</span><span id="dbgNetworkMode" class="value">--</span>
+      <span class="label">STA status</span><span id="dbgStaStatus" class="value">--</span>
+      <span class="label">Network SSID</span><span id="dbgNetworkSsid" class="value">--</span>
+      <span class="label">Robot IP</span><span id="dbgRobotIp" class="value">--</span>
+      <span class="label">AP clients</span><span id="dbgApClients" class="value">--</span>
+      <span class="label">Wi-Fi RSSI</span><span id="dbgRssi" class="value">--</span>
+      <span class="label">Uptime</span><span id="dbgUptime" class="value">--</span>
+    </div>
+
+    <div class="debug-status-row">
+      <span id="dbgConnection" class="debug-connection">Paused</span>
+
+      <div class="debug-log-actions">
+        <button id="exportDebugLog" class="debug-clear" type="button">Export log</button>
+        <button id="clearDebugLog" class="debug-clear" type="button">Clear log</button>
+      </div>
+    </div>
+
+    <div id="dbgMessage" class="debug-message">Open the sidebar to start live debugging.</div>
+
+    <div class="debug-log-title">Firmware update (OTA)</div>
+    <div class="ota-panel">
+      <div class="ota-build">
+        <span>Build</span>
+        <strong id="dbgBuild">--</strong>
+      </div>
+
+      <label class="ota-label" for="otaPassword">OTA password</label>
+      <input
+        id="otaPassword"
+        class="ota-input"
+        type="password"
+        inputmode="numeric"
+        autocomplete="off"
+        placeholder="Enter OTA password">
+
+      <label class="ota-file-label" for="otaFile">Firmware .bin</label>
+      <input
+        id="otaFile"
+        class="ota-file"
+        type="file"
+        accept=".bin,application/octet-stream">
+
+      <button id="otaUploadButton" class="ota-upload" type="button">
+        Upload firmware
+      </button>
+
+      <div class="ota-progress-shell" aria-hidden="true">
+        <div id="otaProgressBar" class="ota-progress-bar"></div>
+      </div>
+      <div id="otaProgressText" class="ota-progress-text">No update selected.</div>
+
+      <div class="ota-warning">
+        Motors stop before update. Do not remove power while firmware is uploading.
+      </div>
+    </div>
+
+    <div class="debug-log-title">Event log</div>
+    <div id="dbgLog" class="debug-log" aria-live="polite"></div>
+
+    <div class="debug-small">
+      The ESP32 keeps the latest 64 debug events, with newest events shown first. Use Export log to save the visible status and event history as a text file. If normal Wi-Fi is unavailable,
+      connect to the robot's fallback AP and open 192.168.4.1. Debug polling runs
+      only while this sidebar is open.
+    </div>
+  </aside>
+
+  <div class="robot">
+    <h1>ESP32-CAM Robot</h1>
+
+    <div id="videoFrame" class="video-frame">
+      <img src="" id="photo" alt="ESP32-CAM video stream">
+    </div>
+
+    <div class="panel">
+      <div class="ui-version">UI: Sync + Serial + Camera Settings + Rotation</div>
+
+      <div class="sync-row">
+        <label class="sync-control">
+          <input id="syncMotors" type="checkbox">
+          Sync motors
+        </label>
+        <span class="sync-note">When enabled, either control changes both.</span>
+      </div>
+
+      <div class="motor-control">
+        <div class="speed-row">
+          <label for="leftSpeedSlider">Left motor</label>
+          <span id="leftSpeedValue" class="speed-value">220 / 255 (86%)</span>
+        </div>
+
+        <div class="motor-adjust">
+          <button class="pwm-step" type="button"
+                  data-motor="left" data-delta="-1"
+                  aria-label="Decrease left motor speed by 1">−1</button>
+
+          <input
+            id="leftSpeedSlider"
+            class="motor-slider"
+            type="range"
+            min="0"
+            max="255"
+            step="1"
+            value="220"
+            aria-label="Left motor speed">
+
+          <button class="pwm-step" type="button"
+                  data-motor="left" data-delta="1"
+                  aria-label="Increase left motor speed by 1">+1</button>
+        </div>
+
+        <div class="speed-scale">
+          <span>0</span>
+          <span>Full range</span>
+          <span>255</span>
+        </div>
+      </div>
+
+      <div class="motor-control">
+        <div class="speed-row">
+          <label for="rightSpeedSlider">Right motor</label>
+          <span id="rightSpeedValue" class="speed-value">220 / 255 (86%)</span>
+        </div>
+
+        <div class="motor-adjust">
+          <button class="pwm-step" type="button"
+                  data-motor="right" data-delta="-1"
+                  aria-label="Decrease right motor speed by 1">−1</button>
+
+          <input
+            id="rightSpeedSlider"
+            class="motor-slider"
+            type="range"
+            min="0"
+            max="255"
+            step="1"
+            value="220"
+            aria-label="Right motor speed">
+
+          <button class="pwm-step" type="button"
+                  data-motor="right" data-delta="1"
+                  aria-label="Increase right motor speed by 1">+1</button>
+        </div>
+
+        <div class="speed-scale">
+          <span>0</span>
+          <span>Full range</span>
+          <span>255</span>
+        </div>
+      </div>
+
+      <div class="button-container">
+        <button class="button forward drive" data-action="forward" aria-label="Forward">↑</button>
+        <button id="ledButton" class="led-button led" type="button">OFF</button>
+
+        <button class="button left drive" data-action="left" aria-label="Left">←</button>
+        <button class="button stop" id="stopButton" type="button" aria-label="Stop">●</button>
+        <button class="button right drive" data-action="right" aria-label="Right">→</button>
+
+        <button
+          class="button backward"
+          type="button"
+          disabled
+          title="Reverse is not enabled in this firmware"
+          aria-label="Reverse not enabled">↓</button>
+      </div>
+
+      <div class="note">
+        Each motor can be set independently from 0 to 255.
+        At very low values a motor may buzz without rotating; that lets students
+        discover the real starting threshold of each motor.
+        The TB6612FNG supports reverse, but this backup UI keeps the original forward-only controls.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const photo = document.getElementById("photo");
+    const videoFrame = document.getElementById("videoFrame");
+    const leftSpeedSlider = document.getElementById("leftSpeedSlider");
+    const rightSpeedSlider = document.getElementById("rightSpeedSlider");
+    const leftSpeedValue = document.getElementById("leftSpeedValue");
+    const rightSpeedValue = document.getElementById("rightSpeedValue");
+    const ledButton = document.getElementById("ledButton");
+    const stopButton = document.getElementById("stopButton");
+    const syncMotors = document.getElementById("syncMotors");
+
+    const settingsToggle = document.getElementById("settingsToggle");
+    const settingsSidebar = document.getElementById("settingsSidebar");
+    const cameraResolution = document.getElementById("cameraResolution");
+    const cameraRotation = document.getElementById("cameraRotation");
+    const cameraQuality = document.getElementById("cameraQuality");
+    const cameraQualityValue = document.getElementById("cameraQualityValue");
+    const cameraBrightness = document.getElementById("cameraBrightness");
+    const cameraBrightnessValue = document.getElementById("cameraBrightnessValue");
+    const cameraContrast = document.getElementById("cameraContrast");
+    const cameraContrastValue = document.getElementById("cameraContrastValue");
+    const cameraSaturation = document.getElementById("cameraSaturation");
+    const cameraSaturationValue = document.getElementById("cameraSaturationValue");
+    const cameraVFlip = document.getElementById("cameraVFlip");
+    const cameraHMirror = document.getElementById("cameraHMirror");
+    const ledBrightnessSlider = document.getElementById("ledBrightnessSlider");
+    const ledBrightnessValue = document.getElementById("ledBrightnessValue");
+    const cameraReset = document.getElementById("cameraReset");
+    const cameraStatus = document.getElementById("cameraStatus");
+
+    const webSerialSupport = document.getElementById("webSerialSupport");
+    const serialBaud = document.getElementById("serialBaud");
+    const serialSelectPort = document.getElementById("serialSelectPort");
+    const serialConnect = document.getElementById("serialConnect");
+    const serialDisconnect = document.getElementById("serialDisconnect");
+    const serialPortLabel = document.getElementById("serialPortLabel");
+    const serialAutoScroll = document.getElementById("serialAutoScroll");
+    const serialClear = document.getElementById("serialClear");
+    const serialSave = document.getElementById("serialSave");
+    const serialTerminal = document.getElementById("serialTerminal");
+    const serialCommandInput = document.getElementById("serialCommandInput");
+    const serialSend = document.getElementById("serialSend");
+
+    const debugToggle = document.getElementById("debugToggle");
+    const debugSidebar = document.getElementById("debugSidebar");
+    const dbgMotion = document.getElementById("dbgMotion");
+    const dbgLeftTarget = document.getElementById("dbgLeftTarget");
+    const dbgRightTarget = document.getElementById("dbgRightTarget");
+    const dbgLeftOutput = document.getElementById("dbgLeftOutput");
+    const dbgRightOutput = document.getElementById("dbgRightOutput");
+    const dbgLed = document.getElementById("dbgLed");
+    const dbgNetworkMode = document.getElementById("dbgNetworkMode");
+    const dbgStaStatus = document.getElementById("dbgStaStatus");
+    const dbgNetworkSsid = document.getElementById("dbgNetworkSsid");
+    const dbgRobotIp = document.getElementById("dbgRobotIp");
+    const dbgApClients = document.getElementById("dbgApClients");
+    const dbgRssi = document.getElementById("dbgRssi");
+    const dbgUptime = document.getElementById("dbgUptime");
+    const dbgMessage = document.getElementById("dbgMessage");
+    const dbgConnection = document.getElementById("dbgConnection");
+    const dbgLog = document.getElementById("dbgLog");
+    const clearDebugLog = document.getElementById("clearDebugLog");
+    const exportDebugLog = document.getElementById("exportDebugLog");
+    const dbgBuild = document.getElementById("dbgBuild");
+    const otaPassword = document.getElementById("otaPassword");
+    const otaFile = document.getElementById("otaFile");
+    const otaUploadButton = document.getElementById("otaUploadButton");
+    const otaProgressBar = document.getElementById("otaProgressBar");
+    const otaProgressText = document.getElementById("otaProgressText");
+
+    let ledState = false;
+    let leftSpeedTimer = null;
+    let rightSpeedTimer = null;
+    let cameraSettingTimer = null;
+    let cameraRotationDegrees = 0;
+    let debugTimer = null;
+    let lastEventId = 0;
+
+    let selectedSerialPort = null;
+    let serialReader = null;
+    let serialReadLoopActive = false;
+    let serialCaptureText = "";
+    let debugLogCount = 0;
+
+    const CAMERA_DIMENSIONS = {
+      QQVGA: [160, 120],
+      QVGA:  [320, 240],
+      VGA:   [640, 480],
+      SVGA:  [800, 600],
+      XGA:   [1024, 768],
+      SXGA:  [1280, 1024],
+      UXGA:  [1600, 1200]
+    };
+
+    function cameraDimensions() {
+      const selected = cameraResolution.value;
+      return CAMERA_DIMENSIONS[selected] || [640, 480];
+    }
+
+    function applyImageRotation(degrees) {
+      const normalized =
+        ((Number(degrees) || 0) % 360 + 360) % 360;
+
+      cameraRotationDegrees = [0, 90, 180, 270].includes(normalized)
+        ? normalized
+        : 0;
+
+      cameraRotation.value = String(cameraRotationDegrees);
+
+      try {
+        localStorage.setItem(
+          "esp32RobotCameraRotation",
+          String(cameraRotationDegrees)
+        );
+      } catch (error) {
+      }
+
+      const [sourceWidth, sourceHeight] = cameraDimensions();
+      const quarterTurn =
+        cameraRotationDegrees === 90 ||
+        cameraRotationDegrees === 270;
+
+      if (quarterTurn) {
+        videoFrame.style.aspectRatio =
+          sourceHeight + " / " + sourceWidth;
+      } else {
+        videoFrame.style.aspectRatio =
+          sourceWidth + " / " + sourceHeight;
+      }
+
+      // Wait for the wrapper to settle, then size the unrotated image so its
+      // rotated bounding box fits the wrapper exactly.
+      requestAnimationFrame(() => {
+        const frameWidth = videoFrame.clientWidth;
+        const frameHeight = videoFrame.clientHeight;
+
+        if (quarterTurn) {
+          photo.style.width = frameHeight + "px";
+          photo.style.height = frameWidth + "px";
+        } else {
+          photo.style.width = frameWidth + "px";
+          photo.style.height = frameHeight + "px";
+        }
+
+        photo.style.transform =
+          "translate(-50%, -50%) rotate(" +
+          cameraRotationDegrees +
+          "deg)";
+      });
+    }
+
+    function restoreImageRotation() {
+      let saved = "0";
+
+      try {
+        saved =
+          localStorage.getItem("esp32RobotCameraRotation") || "0";
+      } catch (error) {
+      }
+
+      applyImageRotation(saved);
+    }
+
+    window.addEventListener("resize", () => {
+      applyImageRotation(cameraRotationDegrees);
+    });
+
+    cameraRotation.addEventListener("change", () => {
+      applyImageRotation(cameraRotation.value);
+      cameraStatus.textContent =
+        "Display rotation set to " +
+        cameraRotationDegrees +
+        "°";
+    });
+
+    window.addEventListener("load", () => {
+      const url = new URL(window.location.href);
+      photo.src = url.protocol + "//" + url.hostname + ":81/stream";
+      restoreImageRotation();
+
+      sendMotorSpeed("left", leftSpeedSlider.value);
+      sendMotorSpeed("right", rightSpeedSlider.value);
+
+      ledBrightnessValue.textContent =
+        ledBrightnessLabel(ledBrightnessSlider.value);
+      request(
+        "/action?ledBrightness=" +
+        encodeURIComponent(ledBrightnessSlider.value)
+      );
+    });
+
+    function request(path) {
+      const xhr = new XMLHttpRequest();
+      xhr.open("GET", path, true);
+      xhr.send();
+    }
+
+    function sendAction(action) {
+      request("/action?go=" + encodeURIComponent(action));
+    }
+
+    function clamp255(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return 0;
+      return Math.max(0, Math.min(255, Math.round(number)));
+    }
+
+    function speedLabel(value) {
+      const v = clamp255(value);
+      const percent = Math.round((v / 255) * 100);
+      return v + " / 255 (" + percent + "%)";
+    }
+
+    function ledBrightnessLabel(value) {
+      const v = clamp255(value);
+      const percent = Math.round((v / 255) * 100);
+      return v + " / 255 (" + percent + "%)";
+    }
+
+    function sendMotorSpeed(motor, value) {
+      const v = clamp255(value);
+      request("/action?" + motor + "Speed=" + v);
+    }
+
+    function setMotorUi(motor, value) {
+      const v = clamp255(value);
+
+      if (motor === "left") {
+        leftSpeedSlider.value = String(v);
+        leftSpeedValue.textContent = speedLabel(v);
+      } else {
+        rightSpeedSlider.value = String(v);
+        rightSpeedValue.textContent = speedLabel(v);
+      }
+
+      return v;
+    }
+
+    function sendSyncedMotorSpeed(value) {
+      const v = clamp255(value);
+      setMotorUi("left", v);
+      setMotorUi("right", v);
+      sendMotorSpeed("left", v);
+      sendMotorSpeed("right", v);
+    }
+
+    function scheduleMotorSpeed(motor, value) {
+      const v = setMotorUi(motor, value);
+
+      if (syncMotors.checked) {
+        setMotorUi(motor === "left" ? "right" : "left", v);
+
+        clearTimeout(leftSpeedTimer);
+        clearTimeout(rightSpeedTimer);
+
+        leftSpeedTimer = setTimeout(() => {
+          sendMotorSpeed("left", v);
+          sendMotorSpeed("right", v);
+        }, 60);
+
+        return;
+      }
+
+      if (motor === "left") {
+        clearTimeout(leftSpeedTimer);
+        leftSpeedTimer = setTimeout(() => sendMotorSpeed("left", v), 60);
+      } else {
+        clearTimeout(rightSpeedTimer);
+        rightSpeedTimer = setTimeout(() => sendMotorSpeed("right", v), 60);
+      }
+    }
+
+    function commitMotorSpeed(motor, value) {
+      const v = setMotorUi(motor, value);
+
+      clearTimeout(leftSpeedTimer);
+      clearTimeout(rightSpeedTimer);
+
+      if (syncMotors.checked) {
+        sendSyncedMotorSpeed(v);
+      } else {
+        sendMotorSpeed(motor, v);
+      }
+    }
+
+    leftSpeedSlider.addEventListener("input", () => {
+      scheduleMotorSpeed("left", leftSpeedSlider.value);
+    });
+
+    leftSpeedSlider.addEventListener("change", () => {
+      commitMotorSpeed("left", leftSpeedSlider.value);
+    });
+
+    rightSpeedSlider.addEventListener("input", () => {
+      scheduleMotorSpeed("right", rightSpeedSlider.value);
+    });
+
+    rightSpeedSlider.addEventListener("change", () => {
+      commitMotorSpeed("right", rightSpeedSlider.value);
+    });
+
+    syncMotors.addEventListener("change", () => {
+      if (syncMotors.checked) {
+        // Left motor becomes the initial reference when sync is enabled.
+        sendSyncedMotorSpeed(leftSpeedSlider.value);
+      }
+    });
+
+    document.querySelectorAll(".pwm-step").forEach((button) => {
+      button.addEventListener("click", () => {
+        const motor = button.dataset.motor;
+        const delta = Number(button.dataset.delta) || 0;
+        const slider = motor === "left"
+          ? leftSpeedSlider
+          : rightSpeedSlider;
+
+        commitMotorSpeed(
+          motor,
+          clamp255(Number(slider.value) + delta)
+        );
+      });
+    });
+
+
+    function formatUptime(ms) {
+      let totalSeconds = Math.floor(ms / 1000);
+      const hours = Math.floor(totalSeconds / 3600);
+      totalSeconds %= 3600;
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return String(hours).padStart(2, "0") + ":" +
+             String(minutes).padStart(2, "0") + ":" +
+             String(seconds).padStart(2, "0");
+    }
+
+    function appendDebugEvent(event) {
+      if (!event || !event.message) return;
+
+      const entry = document.createElement("div");
+      entry.className = "debug-log-entry";
+
+      entry.textContent =
+        "[" + formatUptime(event.timeMs) + "] #" + event.id + "  " + event.message;
+
+      // Newest events go at the TOP of the log.
+      dbgLog.prepend(entry);
+      debugLogCount++;
+
+      // Keep only the newest 60 entries.
+      while (debugLogCount > 60 && dbgLog.lastChild) {
+        dbgLog.removeChild(dbgLog.lastChild);
+        debugLogCount--;
+      }
+
+      // Keep the newest event visible.
+      dbgLog.scrollTop = 0;
+    }
+
+    clearDebugLog.addEventListener("click", () => {
+      dbgLog.textContent = "";
+      debugLogCount = 0;
+      // lastEventId is intentionally kept. Clearing the view should not make
+      // old buffered ESP32 events reappear on the next refresh.
+    });
+
+    function safeFilePart(value) {
+      return String(value || "")
+        .trim()
+        .replace(/[^a-zA-Z0-9._-]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+    }
+
+    exportDebugLog.addEventListener("click", () => {
+      const eventLines = Array.from(
+        dbgLog.querySelectorAll(".debug-log-entry")
+      ).map((entry) => entry.textContent);
+
+      const now = new Date();
+      const exportedAt = now.toLocaleString();
+
+      const header = [
+        "ESP32-CAM Robot Debug Log",
+        "Exported: " + exportedAt,
+        "",
+        "STATUS",
+        "Motion: " + dbgMotion.textContent,
+        "Left target: " + dbgLeftTarget.textContent,
+        "Right target: " + dbgRightTarget.textContent,
+        "Left output: " + dbgLeftOutput.textContent,
+        "Right output: " + dbgRightOutput.textContent,
+        "Flash LED: " + dbgLed.textContent,
+        "Network mode: " + dbgNetworkMode.textContent,
+        "STA status: " + dbgStaStatus.textContent,
+        "Network SSID: " + dbgNetworkSsid.textContent,
+        "Robot IP: " + dbgRobotIp.textContent,
+        "AP clients: " + dbgApClients.textContent,
+        "Wi-Fi RSSI: " + dbgRssi.textContent,
+        "Uptime: " + dbgUptime.textContent,
+        "Build: " + dbgBuild.textContent,
+        "",
+        "LATEST MESSAGE",
+        dbgMessage.textContent || "(none)",
+        "",
+        "EVENT LOG (newest first)"
+      ];
+
+      const body = eventLines.length
+        ? eventLines
+        : ["(no events currently displayed)"];
+
+      const content = header.concat(body).join("\r\n") + "\r\n";
+
+      // UTF-8 BOM + real CRLF line endings give a clean Windows .txt file.
+      const blob = new Blob(["\uFEFF", content], {
+        type: "text/plain;charset=utf-8"
+      });
+
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+
+      const stamp =
+        now.getFullYear() +
+        String(now.getMonth() + 1).padStart(2, "0") +
+        String(now.getDate()).padStart(2, "0") + "_" +
+        String(now.getHours()).padStart(2, "0") +
+        String(now.getMinutes()).padStart(2, "0") +
+        String(now.getSeconds()).padStart(2, "0");
+
+      const robotName =
+        safeFilePart(dbgNetworkSsid.textContent) || "ESP32-Robot";
+
+      link.href = url;
+      link.download = robotName + "_debug_" + stamp + ".txt";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+      otaProgressText.textContent =
+        "Debug log exported as a text file.";
+    });
+
+    function stopDebugPolling() {
+      if (debugTimer !== null) {
+        clearInterval(debugTimer);
+        debugTimer = null;
+      }
+
+      dbgConnection.textContent = "Paused";
+      dbgConnection.classList.remove("live", "error");
+    }
+
+    function startDebugPolling() {
+      if (debugTimer !== null) return;
+
+      refreshDebug();
+      debugTimer = setInterval(refreshDebug, 500);
+    }
+
+    function serialAppend(textChunk) {
+      if (!textChunk) return;
+
+      serialCaptureText += textChunk;
+
+      // Keep the in-browser capture bounded to ~1 MB.
+      if (serialCaptureText.length > 1000000) {
+        serialCaptureText = serialCaptureText.slice(-750000);
+      }
+
+      serialTerminal.textContent = serialCaptureText;
+
+      if (serialAutoScroll.checked) {
+        serialTerminal.scrollTop = serialTerminal.scrollHeight;
+      }
+    }
+
+    function serialSetStatus(message, state) {
+      webSerialSupport.textContent = message;
+      webSerialSupport.classList.remove("ok", "error");
+
+      if (state) {
+        webSerialSupport.classList.add(state);
+      }
+    }
+
+    function serialPortDescription(port) {
+      if (!port || typeof port.getInfo !== "function") {
+        return "Selected serial port";
+      }
+
+      const info = port.getInfo();
+      const parts = [];
+
+      if (info.usbVendorId !== undefined) {
+        parts.push(
+          "VID 0x" +
+          Number(info.usbVendorId).toString(16).padStart(4, "0").toUpperCase()
+        );
+      }
+
+      if (info.usbProductId !== undefined) {
+        parts.push(
+          "PID 0x" +
+          Number(info.usbProductId).toString(16).padStart(4, "0").toUpperCase()
+        );
+      }
+
+      return parts.length ? parts.join(" · ") : "Selected serial port";
+    }
+
+    function updateSerialButtons() {
+      const supported = "serial" in navigator;
+      const isOpen = Boolean(
+        selectedSerialPort &&
+        selectedSerialPort.readable &&
+        selectedSerialPort.writable
+      );
+
+      serialSelectPort.disabled = !supported || isOpen;
+      serialConnect.disabled = !supported || !selectedSerialPort || isOpen;
+      serialDisconnect.disabled = !isOpen;
+      serialSend.disabled = !isOpen;
+      serialBaud.disabled = isOpen;
+    }
+
+    function detectWebSerial() {
+      if (!("serial" in navigator)) {
+        const reason = window.isSecureContext
+          ? "This browser does not expose Web Serial. Use current Chrome or Edge."
+          : "Web Serial is blocked because this page is not a secure context. " +
+            "Chrome/Edge require HTTPS or localhost for direct COM-port access.";
+
+        serialSetStatus(reason, "error");
+        updateSerialButtons();
+        return;
+      }
+
+      serialSetStatus(
+        "Web Serial ready. Select your USB-TTL adapter, then connect at 115200 baud.",
+        "ok"
+      );
+      updateSerialButtons();
+    }
+
+    async function readSerialLoop() {
+      if (!selectedSerialPort || !selectedSerialPort.readable) return;
+
+      serialReadLoopActive = true;
+      const decoder = new TextDecoder();
+
+      try {
+        serialReader = selectedSerialPort.readable.getReader();
+
+        while (serialReadLoopActive) {
+          const result = await serialReader.read();
+
+          if (result.done) break;
+
+          if (result.value) {
+            serialAppend(
+              decoder.decode(result.value, { stream: true })
+            );
+          }
+        }
+
+        serialAppend(decoder.decode());
+      } catch (error) {
+        if (serialReadLoopActive) {
+          serialAppend(
+            "\n[SERIAL READ ERROR] " + error.message + "\n"
+          );
+        }
+      } finally {
+        if (serialReader) {
+          try {
+            serialReader.releaseLock();
+          } catch (error) {
+          }
+        }
+
+        serialReader = null;
+        serialReadLoopActive = false;
+      }
+    }
+
+    async function disconnectSerialPort() {
+      serialReadLoopActive = false;
+
+      if (serialReader) {
+        try {
+          await serialReader.cancel();
+        } catch (error) {
+        }
+      }
+
+      if (selectedSerialPort) {
+        try {
+          await selectedSerialPort.close();
+        } catch (error) {
+        }
+      }
+
+      serialAppend("\n[SERIAL] Disconnected\n");
+      serialSetStatus("Serial port disconnected.", "");
+      updateSerialButtons();
+    }
+
+    serialSelectPort.addEventListener("click", async () => {
+      if (!("serial" in navigator)) {
+        detectWebSerial();
+        return;
+      }
+
+      try {
+        selectedSerialPort = await navigator.serial.requestPort();
+        serialPortLabel.textContent =
+          serialPortDescription(selectedSerialPort);
+
+        serialSetStatus(
+          "Port selected. Click Connect to start capturing UART output.",
+          "ok"
+        );
+      } catch (error) {
+        if (error.name !== "NotFoundError") {
+          serialSetStatus(
+            "Port selection failed: " + error.message,
+            "error"
+          );
+        }
+      }
+
+      updateSerialButtons();
+    });
+
+    serialConnect.addEventListener("click", async () => {
+      if (!selectedSerialPort) return;
+
+      try {
+        const baudRate = Math.max(
+          300,
+          Math.min(2000000, Number(serialBaud.value) || 115200)
+        );
+
+        await selectedSerialPort.open({
+          baudRate: baudRate,
+          dataBits: 8,
+          stopBits: 1,
+          parity: "none",
+          flowControl: "none"
+        });
+
+        serialCaptureText = "";
+        serialTerminal.textContent = "";
+
+        serialAppend(
+          "[SERIAL] Connected at " + baudRate + " baud\n"
+        );
+
+        serialSetStatus(
+          "Connected and capturing UART output.",
+          "ok"
+        );
+
+        updateSerialButtons();
+        readSerialLoop();
+      } catch (error) {
+        serialSetStatus(
+          "Could not open serial port: " + error.message,
+          "error"
+        );
+        updateSerialButtons();
+      }
+    });
+
+    serialDisconnect.addEventListener("click", () => {
+      disconnectSerialPort();
+    });
+
+    serialClear.addEventListener("click", () => {
+      serialCaptureText = "";
+      serialTerminal.textContent = "";
+    });
+
+    serialSave.addEventListener("click", () => {
+      const now = new Date();
+
+      const stamp =
+        now.getFullYear() +
+        String(now.getMonth() + 1).padStart(2, "0") +
+        String(now.getDate()).padStart(2, "0") + "_" +
+        String(now.getHours()).padStart(2, "0") +
+        String(now.getMinutes()).padStart(2, "0") +
+        String(now.getSeconds()).padStart(2, "0");
+
+      const header =
+        "ESP32-CAM Robot USB Serial Capture\r\n" +
+        "Captured: " + now.toLocaleString() + "\r\n" +
+        "Baud: " + serialBaud.value + "\r\n" +
+        "Port: " + serialPortLabel.textContent + "\r\n" +
+        "\r\n";
+
+      const normalized =
+        serialCaptureText.replace(/\r?\n/g, "\r\n");
+
+      const blob = new Blob(
+        ["\uFEFF", header, normalized],
+        { type: "text/plain;charset=utf-8" }
+      );
+
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+
+      link.href = url;
+      link.download =
+        "ESP32_Robot_USB_Serial_" + stamp + ".txt";
+
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+
+    async function sendSerialCommand() {
+      if (
+        !selectedSerialPort ||
+        !selectedSerialPort.writable
+      ) {
+        return;
+      }
+
+      const command = serialCommandInput.value.trim();
+      if (!command) return;
+
+      const writer = selectedSerialPort.writable.getWriter();
+
+      try {
+        const encoder = new TextEncoder();
+        await writer.write(
+          encoder.encode(command + "\r\n")
+        );
+
+        serialAppend("> " + command + "\n");
+        serialCommandInput.value = "";
+      } catch (error) {
+        serialAppend(
+          "\n[SERIAL WRITE ERROR] " + error.message + "\n"
+        );
+      } finally {
+        writer.releaseLock();
+      }
+    }
+
+    serialSend.addEventListener("click", sendSerialCommand);
+
+    serialCommandInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        sendSerialCommand();
+      }
+    });
+
+    if ("serial" in navigator) {
+      navigator.serial.addEventListener("disconnect", (event) => {
+        if (event.target === selectedSerialPort) {
+          serialAppend("\n[SERIAL] USB device disconnected\n");
+          serialReadLoopActive = false;
+          updateSerialButtons();
+        }
+      });
+    }
+
+    detectWebSerial();
+
+    function closeSettingsSidebar() {
+      settingsSidebar.classList.remove("open");
+      settingsToggle.setAttribute("aria-expanded", "false");
+      settingsToggle.textContent = "⚙";
+      settingsToggle.title = "Open settings";
+    }
+
+    function closeDebugSidebar() {
+      debugSidebar.classList.remove("open");
+      debugToggle.setAttribute("aria-expanded", "false");
+      debugToggle.textContent = "☰";
+      debugToggle.title = "Open debug sidebar";
+      stopDebugPolling();
+    }
+
+    async function refreshCameraSettings() {
+      try {
+        cameraStatus.textContent = "Reading camera settings...";
+
+        const response = await fetch("/camera?get=1", {
+          cache: "no-store"
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || ("HTTP " + response.status));
+        }
+
+        cameraResolution.value = data.resolution;
+        applyImageRotation(cameraRotationDegrees);
+        cameraQuality.value = String(data.quality);
+        cameraBrightness.value = String(data.brightness);
+        cameraContrast.value = String(data.contrast);
+        cameraSaturation.value = String(data.saturation);
+        cameraVFlip.checked = Boolean(data.vflip);
+        cameraHMirror.checked = Boolean(data.hmirror);
+
+        cameraQualityValue.textContent = data.quality;
+        cameraBrightnessValue.textContent = data.brightness;
+        cameraContrastValue.textContent = data.contrast;
+        cameraSaturationValue.textContent = data.saturation;
+
+        cameraResolution.querySelectorAll("option[data-psram='1']")
+          .forEach((option) => {
+            option.disabled = !data.psram;
+          });
+
+        cameraStatus.textContent =
+          data.resolution + ", JPEG quality " + data.quality +
+          ", PSRAM " + (data.psram ? "available" : "not available");
+      } catch (error) {
+        cameraStatus.textContent =
+          "Camera status error: " + error.message;
+      }
+    }
+
+    async function setCameraSetting(name, value) {
+      try {
+        cameraStatus.textContent = "Applying " + name + "...";
+
+        const response = await fetch(
+          "/camera?" +
+          encodeURIComponent(name) + "=" +
+          encodeURIComponent(value),
+          { cache: "no-store" }
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || ("HTTP " + response.status));
+        }
+
+        await refreshCameraSettings();
+      } catch (error) {
+        cameraStatus.textContent =
+          "Camera setting failed: " + error.message;
+      }
+    }
+
+    function scheduleCameraSetting(name, value) {
+      clearTimeout(cameraSettingTimer);
+      cameraSettingTimer = setTimeout(() => {
+        setCameraSetting(name, value);
+      }, 120);
+    }
+
+    settingsToggle.addEventListener("click", () => {
+      const isOpen = settingsSidebar.classList.toggle("open");
+      settingsToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
+      settingsToggle.textContent = isOpen ? "×" : "⚙";
+      settingsToggle.title = isOpen ? "Close settings" : "Open settings";
+
+      if (isOpen) {
+        closeDebugSidebar();
+        refreshCameraSettings();
+      }
+    });
+
+    cameraResolution.addEventListener("change", () => {
+      setCameraSetting("resolution", cameraResolution.value);
+    });
+
+    cameraQuality.addEventListener("input", () => {
+      cameraQualityValue.textContent = cameraQuality.value;
+      scheduleCameraSetting("quality", cameraQuality.value);
+    });
+
+    cameraBrightness.addEventListener("input", () => {
+      cameraBrightnessValue.textContent = cameraBrightness.value;
+      scheduleCameraSetting("brightness", cameraBrightness.value);
+    });
+
+    cameraContrast.addEventListener("input", () => {
+      cameraContrastValue.textContent = cameraContrast.value;
+      scheduleCameraSetting("contrast", cameraContrast.value);
+    });
+
+    cameraSaturation.addEventListener("input", () => {
+      cameraSaturationValue.textContent = cameraSaturation.value;
+      scheduleCameraSetting("saturation", cameraSaturation.value);
+    });
+
+    cameraVFlip.addEventListener("change", () => {
+      setCameraSetting("vflip", cameraVFlip.checked ? 1 : 0);
+    });
+
+    cameraHMirror.addEventListener("change", () => {
+      setCameraSetting("hmirror", cameraHMirror.checked ? 1 : 0);
+    });
+
+    cameraReset.addEventListener("click", async () => {
+      try {
+        cameraStatus.textContent = "Resetting camera settings...";
+        const response = await fetch("/camera?reset=1", {
+          cache: "no-store"
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || ("HTTP " + response.status));
+        }
+
+        applyImageRotation(0);
+        await refreshCameraSettings();
+      } catch (error) {
+        cameraStatus.textContent =
+          "Camera reset failed: " + error.message;
+      }
+    });
+
+    debugToggle.addEventListener("click", () => {
+      const isOpen = debugSidebar.classList.toggle("open");
+      debugToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
+      debugToggle.textContent = isOpen ? "×" : "☰";
+      debugToggle.title = isOpen ? "Close debug sidebar" : "Open debug sidebar";
+
+      if (isOpen) {
+        closeSettingsSidebar();
+        startDebugPolling();
+      } else {
+        stopDebugPolling();
+      }
+    });
+
+    async function refreshDebug() {
+      try {
+        const response = await fetch(
+          "/status?after=" + encodeURIComponent(lastEventId),
+          { cache: "no-store" }
+        );
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        const data = await response.json();
+
+        dbgMotion.textContent = data.motion;
+        dbgLeftTarget.textContent = data.leftTarget + " / 255";
+        dbgRightTarget.textContent = data.rightTarget + " / 255";
+        dbgLeftOutput.textContent = data.leftOutput + " / 255";
+        dbgRightOutput.textContent = data.rightOutput + " / 255";
+        dbgLed.textContent =
+          (data.ledEnabled ? "ON " : "OFF ") +
+          data.ledBrightness + " / 255";
+        dbgNetworkMode.textContent = data.networkMode || "--";
+        dbgStaStatus.textContent = data.staStatus || "--";
+        dbgNetworkSsid.textContent = data.networkSsid || "--";
+        dbgRobotIp.textContent = data.robotIp || "--";
+        dbgApClients.textContent = String(data.apClients ?? 0);
+        dbgRssi.textContent =
+          data.rssiValid ? (data.rssi + " dBm") : "N/A";
+        dbgUptime.textContent = formatUptime(data.uptimeMs);
+        dbgBuild.textContent = data.build || "--";
+
+        const message = data.message || "(no message)";
+        dbgMessage.textContent = message;
+
+        if (Array.isArray(data.events)) {
+          data.events.forEach((event) => {
+            if (event.id > lastEventId) {
+              appendDebugEvent(event);
+              lastEventId = event.id;
+            }
+          });
+        }
+
+        // If the ESP32 history wrapped while the sidebar was closed, advance
+        // to the newest known sequence after receiving the retained events.
+        if (Number.isFinite(data.latestEventId) && data.latestEventId > lastEventId) {
+          lastEventId = data.latestEventId;
+        }
+
+        dbgConnection.textContent = "Live";
+        dbgConnection.classList.add("live");
+        dbgConnection.classList.remove("error");
+      } catch (error) {
+        const message = "Status connection error: " + error.message;
+        dbgMessage.textContent = message;
+        dbgConnection.textContent = "Error";
+        dbgConnection.classList.add("error");
+        dbgConnection.classList.remove("live");
+        // Connection errors are browser-side events, so show them directly.
+        appendDebugEvent({
+          id: "browser",
+          timeMs: 0,
+          message: message
+        });
+      }
+    }
+
+    otaUploadButton.addEventListener("click", () => {
+      const file = otaFile.files && otaFile.files[0];
+      const password = otaPassword.value;
+
+      if (!file) {
+        otaProgressText.textContent = "Select a compiled firmware .bin file first.";
+        return;
+      }
+
+      if (!file.name.toLowerCase().endsWith(".bin")) {
+        otaProgressText.textContent = "Please choose an Arduino compiled .bin file.";
+        return;
+      }
+
+      if (!password) {
+        otaProgressText.textContent = "Enter the OTA password.";
+        return;
+      }
+
+      const confirmed = window.confirm(
+        "Upload " + file.name + " (" + Math.round(file.size / 1024) +
+        " KB)?\\n\\nThe motors will stop and the robot will reboot after success."
+      );
+
+      if (!confirmed) return;
+
+      // Reduce ESP32-CAM load during the firmware transfer.
+      sendAction("stop");
+      stopDebugPolling();
+
+      otaUploadButton.disabled = true;
+      otaFile.disabled = true;
+      otaPassword.disabled = true;
+      otaProgressBar.style.width = "0%";
+      otaProgressText.textContent = "Starting upload...";
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/update", true);
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.setRequestHeader("X-OTA-Password", password);
+
+      xhr.upload.addEventListener("progress", (event) => {
+        if (!event.lengthComputable) return;
+
+        const percent = Math.min(
+          100,
+          Math.round((event.loaded / event.total) * 100)
+        );
+
+        otaProgressBar.style.width = percent + "%";
+        otaProgressText.textContent =
+          "Uploading: " + percent + "%  (" +
+          Math.round(event.loaded / 1024) + " / " +
+          Math.round(event.total / 1024) + " KB)";
+      });
+
+      xhr.addEventListener("load", () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          otaProgressBar.style.width = "100%";
+          otaProgressText.textContent =
+            "Firmware accepted. Robot is rebooting...";
+
+          // Give the ESP32 time to restart, then try the same page again.
+          setTimeout(() => {
+            window.location.reload();
+          }, 7000);
+        } else {
+          otaProgressText.textContent =
+            "Update failed: " + (xhr.responseText || ("HTTP " + xhr.status));
+
+          otaUploadButton.disabled = false;
+          otaFile.disabled = false;
+          otaPassword.disabled = false;
+          startDebugPolling();
+        }
+      });
+
+      xhr.addEventListener("error", () => {
+        otaProgressText.textContent =
+          "Upload connection failed. The robot may have restarted or Wi-Fi was lost.";
+
+        otaUploadButton.disabled = false;
+        otaFile.disabled = false;
+        otaPassword.disabled = false;
+        startDebugPolling();
+      });
+
+      xhr.send(file);
+    });
+
+    document.querySelectorAll(".drive").forEach((button) => {
+      const action = button.dataset.action;
+      let pressed = false;
+
+      button.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+
+        if (pressed) return;
+        pressed = true;
+
+        if (button.setPointerCapture) {
+          button.setPointerCapture(event.pointerId);
+        }
+
+        sendAction(action);
+      });
+
+      const stopOnce = (event) => {
+        if (event) event.preventDefault();
+
+        // pointerup is often followed by lostpointercapture.
+        // Only the first release event is allowed to send STOP.
+        if (!pressed) return;
+
+        pressed = false;
+        sendAction("stop");
+      };
+
+      button.addEventListener("pointerup", stopOnce);
+      button.addEventListener("pointercancel", stopOnce);
+      button.addEventListener("lostpointercapture", stopOnce);
+    });
+
+    stopButton.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      sendAction("stop");
+    });
+
+    let ledBrightnessTimer = null;
+
+    ledBrightnessSlider.addEventListener("input", () => {
+      const value = clamp255(ledBrightnessSlider.value);
+      ledBrightnessValue.textContent = ledBrightnessLabel(value);
+
+      clearTimeout(ledBrightnessTimer);
+      ledBrightnessTimer = setTimeout(() => {
+        request(
+          "/action?ledBrightness=" +
+          encodeURIComponent(value)
+        );
+      }, 60);
+    });
+
+    ledBrightnessSlider.addEventListener("change", () => {
+      const value = clamp255(ledBrightnessSlider.value);
+      clearTimeout(ledBrightnessTimer);
+      ledBrightnessValue.textContent = ledBrightnessLabel(value);
+      request(
+        "/action?ledBrightness=" +
+        encodeURIComponent(value)
+      );
+    });
+
+    ledButton.addEventListener("click", () => {
+      ledState = !ledState;
+      ledButton.classList.toggle("led-on", ledState);
+      ledButton.textContent = ledState ? "ON" : "OFF";
+      request("/action?led=" + (ledState ? "on" : "off"));
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
+
+static esp_err_t index_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_set_hdr(
+    req,
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate, max-age=0"
+  );
+  httpd_resp_set_hdr(req, "Pragma", "no-cache");
+  httpd_resp_set_hdr(req, "Expires", "0");
+  httpd_resp_set_hdr(req, "Permissions-Policy", "serial=(self)");
+
+  return httpd_resp_send(
+    req,
+    (const char *)INDEX_HTML,
+    strlen(INDEX_HTML)
+  );
+}
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+  size_t jpgLen = 0;
+  uint8_t *jpgBuf = NULL;
+  char partBuf[64];
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+
+  while (true) {
+    fb = esp_camera_fb_get();
+
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+    } else {
+      if (fb->format == PIXFORMAT_JPEG) {
+        jpgLen = fb->len;
+        jpgBuf = fb->buf;
+      } else {
+        bool converted = frame2jpg(fb, 80, &jpgBuf, &jpgLen);
+        esp_camera_fb_return(fb);
+        fb = NULL;
+
+        if (!converted) {
+          Serial.println("JPEG compression failed");
+          res = ESP_FAIL;
+        }
+      }
+    }
+
+    if (res == ESP_OK) {
+      size_t hlen = snprintf(partBuf, sizeof(partBuf), _STREAM_PART, jpgLen);
+      res = httpd_resp_send_chunk(req, partBuf, hlen);
+    }
+
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)jpgBuf, jpgLen);
+    }
+
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      jpgBuf = NULL;
+    } else if (jpgBuf) {
+      free(jpgBuf);
+      jpgBuf = NULL;
+    }
+
+    if (res != ESP_OK) break;
+  }
+
+  return res;
+}
+
+static void sanitizeJsonText(char *text) {
+  if (!text) return;
+
+  for (size_t i = 0; text[i] != '\0'; i++) {
+    // Our debug messages are simple ASCII. Replace characters that would need
+    // JSON escaping so the response always remains valid.
+    if (text[i] == '"' || text[i] == '\\' ||
+        text[i] == '\r' || text[i] == '\n' ||
+        (uint8_t)text[i] < 0x20) {
+      text[i] = ' ';
+    }
+  }
+}
+
+static esp_err_t status_handler(httpd_req_t *req) {
+  uint32_t afterId = 0;
+
+  // Optional query: /status?after=<last event id seen by browser>
+  char query[64] = {0};
+  char value[24] = {0};
+
+  if (httpd_req_get_url_query_len(req) > 0 &&
+      httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+      httpd_query_key_value(query, "after", value, sizeof(value)) == ESP_OK) {
+    afterId = strtoul(value, NULL, 10);
+  }
+
+  char messageCopy[128];
+  uint8_t sizeCopy;
+  uint8_t headCopy;
+  uint32_t latestEventId;
+
+  portENTER_CRITICAL(&debugMux);
+  strncpy(messageCopy, lastDebugMessage, sizeof(messageCopy) - 1);
+  messageCopy[sizeof(messageCopy) - 1] = '\0';
+  sizeCopy = debugEventSize;
+  headCopy = debugEventHead;
+  latestEventId = debugEventSequence;
+  portEXIT_CRITICAL(&debugMux);
+
+  sanitizeJsonText(messageCopy);
+
+  char networkSsid[64] = "";
+  char robotIp[24] = "";
+  const char *mode = networkModeName();
+
+  bool staConnected = (WiFi.status() == WL_CONNECTED);
+  bool rssiValid = staConnected;
+  long rssi = staConnected ? (long)WiFi.RSSI() : 0;
+  unsigned int apClients = fallbackApActive ? WiFi.softAPgetStationNum() : 0;
+
+  if (staConnected) {
+    String staSsid = WiFi.SSID();
+    staSsid.toCharArray(networkSsid, sizeof(networkSsid));
+
+    IPAddress ip = WiFi.localIP();
+    snprintf(
+      robotIp,
+      sizeof(robotIp),
+      "%u.%u.%u.%u",
+      ip[0], ip[1], ip[2], ip[3]
+    );
+  } else if (fallbackApActive) {
+    strncpy(networkSsid, fallbackApSsid, sizeof(networkSsid) - 1);
+    networkSsid[sizeof(networkSsid) - 1] = '\0';
+
+    IPAddress ip = WiFi.softAPIP();
+    snprintf(
+      robotIp,
+      sizeof(robotIp),
+      "%u.%u.%u.%u",
+      ip[0], ip[1], ip[2], ip[3]
+    );
+  } else {
+    strncpy(networkSsid, "(none)", sizeof(networkSsid) - 1);
+    networkSsid[sizeof(networkSsid) - 1] = '\0';
+    strncpy(robotIp, "0.0.0.0", sizeof(robotIp) - 1);
+    robotIp[sizeof(robotIp) - 1] = '\0';
+  }
+
+  sanitizeJsonText(networkSsid);
+  sanitizeJsonText(robotIp);
+
+  // Room for the status fields plus retained debug events.
+  const size_t JSON_SIZE = 12288;
+  char *json = (char *)malloc(JSON_SIZE);
+  if (!json) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  size_t used = 0;
+  int written = snprintf(
+    json,
+    JSON_SIZE,
+    "{\"motion\":\"%s\","
+    "\"leftTarget\":%d,"
+    "\"rightTarget\":%d,"
+    "\"leftOutput\":%d,"
+    "\"rightOutput\":%d,"
+    "\"ledEnabled\":%s,"
+    "\"ledBrightness\":%d,"
+    "\"networkMode\":\"%s\","
+    "\"staStatus\":\"%s\","
+    "\"networkSsid\":\"%s\","
+    "\"robotIp\":\"%s\","
+    "\"apClients\":%u,"
+    "\"rssi\":%ld,"
+    "\"rssiValid\":%s,"
+    "\"uptimeMs\":%lu,"
+    "\"build\":\"%s %s\","
+    "\"message\":\"%s\","
+    "\"latestEventId\":%lu,"
+    "\"events\":[",
+    motionName(motionState),
+    leftMotorSpeed,
+    rightMotorSpeed,
+    currentLeftPWM,
+    currentRightPWM,
+    ledEnabled ? "true" : "false",
+    ledBrightness,
+    mode,
+    wifiStatusName(WiFi.status()),
+    networkSsid,
+    robotIp,
+    apClients,
+    rssi,
+    rssiValid ? "true" : "false",
+    (unsigned long)millis(),
+    __DATE__,
+    __TIME__,
+    messageCopy,
+    (unsigned long)latestEventId
+  );
+
+  if (written < 0 || (size_t)written >= JSON_SIZE) {
+    free(json);
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  used = (size_t)written;
+
+  // Oldest event is head-size (wrapped into the circular buffer).
+  uint8_t oldest = (headCopy + DEBUG_EVENT_COUNT - sizeCopy) % DEBUG_EVENT_COUNT;
+  bool firstEvent = true;
+
+  for (uint8_t i = 0; i < sizeCopy; i++) {
+    uint8_t index = (oldest + i) % DEBUG_EVENT_COUNT;
+    DebugEvent eventCopy;
+
+    // Copy one event atomically. Keeping the critical section this short
+    // avoids interfering with motor/camera work.
+    portENTER_CRITICAL(&debugMux);
+    eventCopy = debugEvents[index];
+    portEXIT_CRITICAL(&debugMux);
+
+    if (eventCopy.id <= afterId || eventCopy.id == 0) {
+      continue;
+    }
+
+    sanitizeJsonText(eventCopy.message);
+
+    written = snprintf(
+      json + used,
+      JSON_SIZE - used,
+      "%s{\"id\":%lu,\"timeMs\":%lu,\"message\":\"%s\"}",
+      firstEvent ? "" : ",",
+      (unsigned long)eventCopy.id,
+      (unsigned long)eventCopy.timeMs,
+      eventCopy.message
+    );
+
+    if (written < 0 || (size_t)written >= (JSON_SIZE - used)) {
+      break;
+    }
+
+    used += (size_t)written;
+    firstEvent = false;
+  }
+
+  if (used + 3 >= JSON_SIZE) {
+    free(json);
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  json[used++] = ']';
+  json[used++] = '}';
+  json[used] = '\0';
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t result = httpd_resp_send(req, json, used);
+
+  free(json);
+  return result;
+}
+
+static esp_err_t sendCameraStatus(httpd_req_t *req) {
+  sensor_t *sensor = esp_camera_sensor_get();
+
+  if (!sensor) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(
+      req,
+      "{\"error\":\"Camera sensor unavailable\"}",
+      HTTPD_RESP_USE_STRLEN
+    );
+  }
+
+  char json[320];
+
+  snprintf(
+    json,
+    sizeof(json),
+    "{\"resolution\":\"%s\","
+    "\"quality\":%u,"
+    "\"brightness\":%d,"
+    "\"contrast\":%d,"
+    "\"saturation\":%d,"
+    "\"vflip\":%u,"
+    "\"hmirror\":%u,"
+    "\"psram\":%s}",
+    frameSizeName(sensor->status.framesize),
+    (unsigned int)sensor->status.quality,
+    (int)sensor->status.brightness,
+    (int)sensor->status.contrast,
+    (int)sensor->status.saturation,
+    (unsigned int)sensor->status.vflip,
+    (unsigned int)sensor->status.hmirror,
+    cameraHasPsram ? "true" : "false"
+  );
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t camera_handler(httpd_req_t *req) {
+  sensor_t *sensor = esp_camera_sensor_get();
+
+  if (!sensor) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(
+      req,
+      "{\"error\":\"Camera sensor unavailable\"}",
+      HTTPD_RESP_USE_STRLEN
+    );
+  }
+
+  char query[128] = {0};
+  char value[32] = {0};
+
+  if (httpd_req_get_url_query_len(req) == 0) {
+    return sendCameraStatus(req);
+  }
+
+  if (httpd_req_get_url_query_str(
+        req,
+        query,
+        sizeof(query)
+      ) != ESP_OK) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(
+      req,
+      "{\"error\":\"Invalid camera query\"}",
+      HTTPD_RESP_USE_STRLEN
+    );
+  }
+
+  if (httpd_query_key_value(
+        query,
+        "get",
+        value,
+        sizeof(value)
+      ) == ESP_OK) {
+    return sendCameraStatus(req);
+  }
+
+  if (httpd_query_key_value(
+        query,
+        "reset",
+        value,
+        sizeof(value)
+      ) == ESP_OK) {
+    framesize_t defaultFrame =
+      cameraHasPsram ? FRAMESIZE_VGA : FRAMESIZE_QVGA;
+
+    int result = 0;
+    result |= sensor->set_framesize(sensor, defaultFrame);
+    result |= sensor->set_quality(sensor, cameraHasPsram ? 10 : 12);
+    result |= sensor->set_brightness(sensor, 0);
+    result |= sensor->set_contrast(sensor, 0);
+    result |= sensor->set_saturation(sensor, 0);
+    result |= sensor->set_vflip(sensor, 0);
+    result |= sensor->set_hmirror(sensor, 0);
+
+    if (result != 0) {
+      httpd_resp_set_status(req, "500 Internal Server Error");
+      httpd_resp_set_type(req, "application/json");
+      return httpd_resp_send(
+        req,
+        "{\"error\":\"Camera reset failed\"}",
+        HTTPD_RESP_USE_STRLEN
+      );
+    }
+
+    setDebugMessage("CAMERA: Settings reset to defaults");
+    return sendCameraStatus(req);
+  }
+
+  int result = 0;
+  char dbg[128];
+
+  if (httpd_query_key_value(
+        query,
+        "resolution",
+        value,
+        sizeof(value)
+      ) == ESP_OK) {
+    framesize_t requested;
+
+    if (!parseFrameSize(value, &requested)) {
+      httpd_resp_set_status(req, "400 Bad Request");
+      httpd_resp_set_type(req, "application/json");
+      return httpd_resp_send(
+        req,
+        "{\"error\":\"Unsupported resolution\"}",
+        HTTPD_RESP_USE_STRLEN
+      );
+    }
+
+    if (!cameraHasPsram && frameSizeNeedsPsram(requested)) {
+      httpd_resp_set_status(req, "400 Bad Request");
+      httpd_resp_set_type(req, "application/json");
+      return httpd_resp_send(
+        req,
+        "{\"error\":\"This resolution requires PSRAM\"}",
+        HTTPD_RESP_USE_STRLEN
+      );
+    }
+
+    result = sensor->set_framesize(sensor, requested);
+    snprintf(dbg, sizeof(dbg), "CAMERA: Resolution -> %s", value);
+
+  } else if (httpd_query_key_value(
+               query,
+               "quality",
+               value,
+               sizeof(value)
+             ) == ESP_OK) {
+    int requested = constrain(atoi(value), 4, 63);
+    result = sensor->set_quality(sensor, requested);
+    snprintf(dbg, sizeof(dbg), "CAMERA: JPEG quality -> %d", requested);
+
+  } else if (httpd_query_key_value(
+               query,
+               "brightness",
+               value,
+               sizeof(value)
+             ) == ESP_OK) {
+    int requested = constrain(atoi(value), -2, 2);
+    result = sensor->set_brightness(sensor, requested);
+    snprintf(dbg, sizeof(dbg), "CAMERA: Brightness -> %d", requested);
+
+  } else if (httpd_query_key_value(
+               query,
+               "contrast",
+               value,
+               sizeof(value)
+             ) == ESP_OK) {
+    int requested = constrain(atoi(value), -2, 2);
+    result = sensor->set_contrast(sensor, requested);
+    snprintf(dbg, sizeof(dbg), "CAMERA: Contrast -> %d", requested);
+
+  } else if (httpd_query_key_value(
+               query,
+               "saturation",
+               value,
+               sizeof(value)
+             ) == ESP_OK) {
+    int requested = constrain(atoi(value), -2, 2);
+    result = sensor->set_saturation(sensor, requested);
+    snprintf(dbg, sizeof(dbg), "CAMERA: Saturation -> %d", requested);
+
+  } else if (httpd_query_key_value(
+               query,
+               "vflip",
+               value,
+               sizeof(value)
+             ) == ESP_OK) {
+    int requested = atoi(value) ? 1 : 0;
+    result = sensor->set_vflip(sensor, requested);
+    snprintf(dbg, sizeof(dbg), "CAMERA: Vertical flip -> %s",
+             requested ? "ON" : "OFF");
+
+  } else if (httpd_query_key_value(
+               query,
+               "hmirror",
+               value,
+               sizeof(value)
+             ) == ESP_OK) {
+    int requested = atoi(value) ? 1 : 0;
+    result = sensor->set_hmirror(sensor, requested);
+    snprintf(dbg, sizeof(dbg), "CAMERA: Horizontal mirror -> %s",
+             requested ? "ON" : "OFF");
+
+  } else {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(
+      req,
+      "{\"error\":\"Unknown camera setting\"}",
+      HTTPD_RESP_USE_STRLEN
+    );
+  }
+
+  if (result != 0) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(
+      req,
+      "{\"error\":\"Camera sensor rejected the setting\"}",
+      HTTPD_RESP_USE_STRLEN
+    );
+  }
+
+  setDebugMessage(dbg);
+  return sendCameraStatus(req);
+}
+
+static bool otaPasswordValid(httpd_req_t *req) {
+  size_t len = httpd_req_get_hdr_value_len(req, "X-OTA-Password");
+  if (len == 0 || len >= 64) return false;
+
+  char supplied[64] = {0};
+
+  if (httpd_req_get_hdr_value_str(
+        req,
+        "X-OTA-Password",
+        supplied,
+        sizeof(supplied)
+      ) != ESP_OK) {
+    return false;
+  }
+
+  return strcmp(supplied, OTA_PASSWORD) == 0;
+}
+
+static esp_err_t update_handler(httpd_req_t *req) {
+  if (!otaPasswordValid(req)) {
+    setDebugMessage("OTA: Rejected update - wrong password");
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "Wrong OTA password", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  if (req->content_len <= 0) {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_send(req, "Firmware file is empty", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  otaInProgress = true;
+  commandStop();
+  ledEnabled = false;
+  applyLedOutput();
+  setDebugMessage("OTA: Firmware upload started; motors and flash LED stopped");
+
+  size_t firmwareSize = (size_t)req->content_len;
+
+  if (!Update.begin(firmwareSize, U_FLASH)) {
+    char dbg[128];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "OTA: Update.begin failed; error %u",
+      (unsigned int)Update.getError()
+    );
+    setDebugMessage(dbg);
+
+    otaInProgress = false;
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(
+      req,
+      "OTA could not start. Check that an OTA-capable partition scheme is flashed by USB.",
+      HTTPD_RESP_USE_STRLEN
+    );
+    return ESP_OK;
+  }
+
+  const size_t BUFFER_SIZE = 4096;
+  uint8_t *buffer = (uint8_t *)malloc(BUFFER_SIZE);
+
+  if (!buffer) {
+    Update.abort();
+    otaInProgress = false;
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_send(req, "Not enough RAM for OTA buffer", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  size_t remaining = firmwareSize;
+  size_t writtenTotal = 0;
+  bool receiveFailed = false;
+
+  while (remaining > 0) {
+    int toRead = (remaining > BUFFER_SIZE) ? BUFFER_SIZE : (int)remaining;
+    int received = httpd_req_recv(req, (char *)buffer, toRead);
+
+    if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+      continue;
+    }
+
+    if (received <= 0) {
+      receiveFailed = true;
+      break;
+    }
+
+    size_t written = Update.write(buffer, (size_t)received);
+
+    if (written != (size_t)received) {
+      receiveFailed = true;
+      break;
+    }
+
+    writtenTotal += written;
+    remaining -= (size_t)received;
+  }
+
+  free(buffer);
+
+  if (receiveFailed || writtenTotal != firmwareSize) {
+    Update.abort();
+
+    char dbg[128];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "OTA: Upload failed after %u / %u bytes; error %u",
+      (unsigned int)writtenTotal,
+      (unsigned int)firmwareSize,
+      (unsigned int)Update.getError()
+    );
+    setDebugMessage(dbg);
+
+    otaInProgress = false;
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "Firmware transfer failed", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  if (!Update.end(true)) {
+    char dbg[128];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "OTA: Firmware validation failed; error %u",
+      (unsigned int)Update.getError()
+    );
+    setDebugMessage(dbg);
+
+    otaInProgress = false;
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, "Firmware validation failed", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  setDebugMessage("OTA: Firmware update successful; rebooting");
+
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_set_hdr(req, "Connection", "close");
+  httpd_resp_send(req, "OK - rebooting", HTTPD_RESP_USE_STRLEN);
+
+  delay(750);
+  ESP.restart();
+
+  return ESP_OK;
+}
+
+static esp_err_t action_handler(httpd_req_t *req) {
+  char query[128] = {0};
+  int len = httpd_req_get_url_query_len(req) + 1;
+
+  if (len <= 1 || len > (int)sizeof(query)) {
+    httpd_resp_send_404(req);
+    return ESP_OK;
+  }
+
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+    httpd_resp_send_404(req);
+    return ESP_OK;
+  }
+
+  char value[32] = {0};
+
+  // Independent full-range motor sliders.
+  // /action?leftSpeed=0-255
+  if (httpd_query_key_value(query, "leftSpeed", value, sizeof(value)) == ESP_OK) {
+    leftMotorSpeed = constrain(atoi(value), MIN_PWM, MAX_PWM);
+
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg), "Left speed set to %d / 255", leftMotorSpeed);
+    setDebugMessage(dbg);
+
+    if (motionState != MOTION_STOPPED) {
+      applyMotion();
+    }
+
+    httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  // /action?rightSpeed=0-255
+  if (httpd_query_key_value(query, "rightSpeed", value, sizeof(value)) == ESP_OK) {
+    rightMotorSpeed = constrain(atoi(value), MIN_PWM, MAX_PWM);
+
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg), "Right speed set to %d / 255", rightMotorSpeed);
+    setDebugMessage(dbg);
+
+    if (motionState != MOTION_STOPPED) {
+      applyMotion();
+    }
+
+    httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  // Flash LED brightness: /action?ledBrightness=0-255
+  if (httpd_query_key_value(
+        query,
+        "ledBrightness",
+        value,
+        sizeof(value)
+      ) == ESP_OK) {
+    ledBrightness = clampLedPWM(atoi(value));
+    applyLedOutput();
+
+    char dbg[96];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "Flash LED brightness set to %d / 255",
+      ledBrightness
+    );
+    setDebugMessage(dbg);
+
+    httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  // Flash LED: /action?led=on|off
+  if (httpd_query_key_value(query, "led", value, sizeof(value)) == ESP_OK) {
+    ledEnabled = (strcmp(value, "on") == 0);
+    applyLedOutput();
+
+    char dbg[96];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "Flash LED %s at %d / 255",
+      ledEnabled ? "ON" : "OFF",
+      ledBrightness
+    );
+    setDebugMessage(dbg);
+
+    httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  // Motion: /action?go=forward|left|right|stop
+  if (httpd_query_key_value(query, "go", value, sizeof(value)) == ESP_OK) {
+    if (strcmp(value, "forward") == 0) {
+      setDebugMessage("Command: FORWARD");
+      moveForward();
+
+    } else if (strcmp(value, "left") == 0) {
+      setDebugMessage("Command: LEFT");
+      turnLeft();
+
+    } else if (strcmp(value, "right") == 0) {
+      setDebugMessage("Command: RIGHT");
+      turnRight();
+
+    } else {
+      // Includes stop and unsupported commands such as backward.
+      setDebugMessage("Command: STOP");
+      commandStop();
+    }
+  }
+
+  httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+
+  httpd_uri_t index_uri = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = index_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t cmd_uri = {
+    .uri = "/action",
+    .method = HTTP_GET,
+    .handler = action_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t status_uri = {
+    .uri = "/status",
+    .method = HTTP_GET,
+    .handler = status_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t camera_uri = {
+    .uri = "/camera",
+    .method = HTTP_GET,
+    .handler = camera_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t update_uri = {
+    .uri = "/update",
+    .method = HTTP_POST,
+    .handler = update_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t stream_uri = {
+    .uri = "/stream",
+    .method = HTTP_GET,
+    .handler = stream_handler,
+    .user_ctx = NULL
+  };
+
+  if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(camera_httpd, &index_uri);
+    httpd_register_uri_handler(camera_httpd, &cmd_uri);
+    httpd_register_uri_handler(camera_httpd, &status_uri);
+    httpd_register_uri_handler(camera_httpd, &camera_uri);
+    httpd_register_uri_handler(camera_httpd, &update_uri);
+  }
+
+  config.server_port += 1;
+  config.ctrl_port += 1;
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+  }
+}

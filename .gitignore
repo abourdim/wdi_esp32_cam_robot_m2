@@ -1,0 +1,9 @@
+# PlatformIO build artifacts (the project root is the sketch folder)
+.pio/
+.vscode/
+
+# Application binaries exported for the browser OTA uploader
+export/
+
+*.pyc
+__pycache__/
