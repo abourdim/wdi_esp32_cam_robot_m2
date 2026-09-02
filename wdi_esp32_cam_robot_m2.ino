@@ -380,8 +380,14 @@ static void makeFallbackApName() {
 static bool startFallbackAccessPoint() {
   makeFallbackApName();
 
-  // AP+STA keeps the robot directly reachable while the station interface
-  // continues trying to reach the configured school/home Wi-Fi.
+  // Stop the timed-out STA association before enabling the fallback AP.  A
+  // still-running Wi-Fi scan/association can keep moving the shared radio
+  // between channels and make the AP answer ICMP while TCP connections time
+  // out.  Keep AP+STA capability enabled, but leave STA idle until the retry
+  // service decides it is safe to try again.
+  WiFi.disconnect(false, false);
+  delay(100);
+
   WiFi.mode(WIFI_AP_STA);
   // Changing mode resets the power-save setting, so re-apply it here too.
   WiFi.setSleep(false);
@@ -413,9 +419,13 @@ static bool startFallbackAccessPoint() {
   );
   setDebugMessage(dbg);
 
-  // Re-start the station attempt after switching to AP+STA mode.
-  WiFi.begin(ssid, password);
+  // Do not call WiFi.begin() here.  The initial attempt has just timed out and
+  // immediately starting a second association is exactly when users connect
+  // to 192.168.4.1.  serviceWiFiFallback() will retry later, and pauses those
+  // retries whenever an AP client is present.
   lastWiFiRetryMs = millis();
+  wifiRetryIntervalMs = WIFI_RETRY_INTERVAL_MS;
+  wifiRetryPaused = false;
 
   return true;
 }
@@ -539,7 +549,7 @@ static volatile uint32_t streamFps10 = 0;
 // normal; a number that climbs on its own is a link that keeps dropping.
 static volatile uint32_t streamDropCount = 0;
 
-void startCameraServer();
+bool startCameraServer();
 static void checkIndexGzAsset();
 
 static int clampMotorPWM(int value) {
@@ -1360,8 +1370,11 @@ void setup() {
   checkIndexGzAsset();
 
   setDebugMessage("BOOT: Starting HTTP and camera-stream servers");
-  startCameraServer();
-  setDebugMessage("BOOT: Robot web server ready");
+  if (startCameraServer()) {
+    setDebugMessage("BOOT: Robot web server ready");
+  } else {
+    setDebugMessage("ERROR: Robot web server failed to start");
+  }
 }
 
 void loop() {
@@ -7232,15 +7245,18 @@ static esp_err_t action_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
-void startCameraServer() {
+bool startCameraServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
-  // The control server now registers eight routes, which is the default
-  // ceiling exactly; the next one added would fail silently.
+  // The control server registers nine routes.  Leave some headroom for future
+  // routes, but do not reserve the default seven client sockets: two HTTP
+  // servers plus the Wi-Fi stack can otherwise exhaust the ESP32's socket/file
+  // descriptor budget on camera builds.
   config.max_uri_handlers = 12;
-  // Browsers that walk away mid-request leave sockets behind; reclaim the
-  // least recently used one instead of refusing the next connection.
+  config.max_open_sockets = 4;
   config.lru_purge_enable = true;
+  config.recv_wait_timeout = 5;
+  config.send_wait_timeout = 5;
 
   httpd_uri_t index_uri = {
     .uri = "/",
@@ -7312,31 +7328,129 @@ void startCameraServer() {
     .user_ctx = NULL
   };
 
-  if (httpd_start(&camera_httpd, &config) == ESP_OK) {
-    httpd_register_uri_handler(camera_httpd, &index_uri);
-    httpd_register_uri_handler(camera_httpd, &cmd_uri);
-    httpd_register_uri_handler(camera_httpd, &status_uri);
-    httpd_register_uri_handler(camera_httpd, &camera_uri);
-    httpd_register_uri_handler(camera_httpd, &wifi_uri);
-    httpd_register_uri_handler(camera_httpd, &capture_uri);
-    httpd_register_uri_handler(camera_httpd, &program_get_uri);
-    httpd_register_uri_handler(camera_httpd, &program_post_uri);
-    httpd_register_uri_handler(camera_httpd, &update_uri);
+  // Never print "ready" unless the listening socket was actually created.
+  // The old code silently ignored httpd_start() failures, which made a dead
+  // port 80 look like a browser problem.
+  camera_httpd = NULL;
+  esp_err_t err = httpd_start(&camera_httpd, &config);
+  if (err != ESP_OK) {
+    char dbg[128];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "ERROR: HTTP control server port 80 failed: 0x%x (%s), free heap %u",
+      (unsigned int)err,
+      esp_err_to_name(err),
+      (unsigned int)ESP.getFreeHeap()
+    );
+    setDebugMessage(dbg);
+    return false;
   }
 
-  config.server_port += 1;
-  config.ctrl_port += 1;
+  {
+    char dbg[96];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "HTTP: control server listening on port 80; free heap %u",
+      (unsigned int)ESP.getFreeHeap()
+    );
+    setDebugMessage(dbg);
+  }
 
-  // The stream server has one worker and the handler holds it for the whole
-  // connection. Give it a stack the camera driver fits in, few sockets, and
-  // send/receive timeouts so a browser that vanishes without closing frees
-  // the stream instead of blocking it until the next reboot.
+  bool routesOk = true;
+
+#define REGISTER_CONTROL_URI(uriDef) do {                                      \
+    esp_err_t registerErr = httpd_register_uri_handler(camera_httpd, &(uriDef)); \
+    if (registerErr != ESP_OK) {                                               \
+      char dbg[144];                                                           \
+      snprintf(                                                                \
+        dbg, sizeof(dbg),                                                      \
+        "ERROR: HTTP route %s %s failed: 0x%x (%s)",                         \
+        ((uriDef).method == HTTP_POST ? "POST" : "GET"),                   \
+        (uriDef).uri,                                                          \
+        (unsigned int)registerErr,                                             \
+        esp_err_to_name(registerErr)                                           \
+      );                                                                       \
+      setDebugMessage(dbg);                                                    \
+      routesOk = false;                                                        \
+    }                                                                          \
+  } while (0)
+
+  REGISTER_CONTROL_URI(index_uri);
+  REGISTER_CONTROL_URI(cmd_uri);
+  REGISTER_CONTROL_URI(status_uri);
+  REGISTER_CONTROL_URI(camera_uri);
+  REGISTER_CONTROL_URI(wifi_uri);
+  REGISTER_CONTROL_URI(capture_uri);
+  REGISTER_CONTROL_URI(program_get_uri);
+  REGISTER_CONTROL_URI(program_post_uri);
+  REGISTER_CONTROL_URI(update_uri);
+
+#undef REGISTER_CONTROL_URI
+
+  if (!routesOk) {
+    setDebugMessage("ERROR: One or more HTTP control routes failed to register");
+    httpd_stop(camera_httpd);
+    camera_httpd = NULL;
+    return false;
+  }
+
+  // The stream uses a separate server because its handler owns one worker for
+  // the entire MJPEG connection.  Keep its socket allowance deliberately
+  // small so the control UI remains reachable.
+  config.server_port = 81;
+  config.ctrl_port += 1;
   config.stack_size = 8192;
-  config.max_open_sockets = 3;
+  config.max_open_sockets = 2;
+  config.max_uri_handlers = 2;
   config.recv_wait_timeout = 5;
   config.send_wait_timeout = 5;
 
-  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
-    httpd_register_uri_handler(stream_httpd, &stream_uri);
+  stream_httpd = NULL;
+  err = httpd_start(&stream_httpd, &config);
+  if (err != ESP_OK) {
+    // Control on port 80 is still useful without live video, so keep it up and
+    // report the degraded state rather than making the whole UI unreachable.
+    char dbg[128];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "WARN: HTTP stream server port 81 failed: 0x%x (%s), free heap %u",
+      (unsigned int)err,
+      esp_err_to_name(err),
+      (unsigned int)ESP.getFreeHeap()
+    );
+    setDebugMessage(dbg);
+    return true;
   }
+
+  err = httpd_register_uri_handler(stream_httpd, &stream_uri);
+  if (err != ESP_OK) {
+    char dbg[120];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "WARN: HTTP stream route failed: 0x%x (%s)",
+      (unsigned int)err,
+      esp_err_to_name(err)
+    );
+    setDebugMessage(dbg);
+    httpd_stop(stream_httpd);
+    stream_httpd = NULL;
+    return true;
+  }
+
+  {
+    char dbg[96];
+    snprintf(
+      dbg,
+      sizeof(dbg),
+      "HTTP: stream server listening on port 81; free heap %u",
+      (unsigned int)ESP.getFreeHeap()
+    );
+    setDebugMessage(dbg);
+  }
+
+  return true;
 }
