@@ -2059,6 +2059,27 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       opacity: 1;
     }
 
+    /* The SSID is the only readout of unpredictable width -- a network name
+       runs to 32 characters -- so it is the one that gives way when the frame
+       is narrow, and it gives way only then. A fixed ch ceiling was worse
+       than no ceiling: it clipped the robot's own 16-character name on a
+       frame with room to spare. */
+    #videoSsid {
+      overflow: hidden;
+      min-width: 0;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Hold their natural width, or flex would shrink these too and the fps
+       figure would start losing digits before the SSID had given up a
+       character. */
+    #videoFps,
+    #videoRssi,
+    #videoMotion {
+      flex: 0 0 auto;
+    }
+
     #videoRssi.is-weak {
       color: #fbbf24;
     }
@@ -2074,7 +2095,8 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     /* On a narrow frame the wordmark goes and the logo stays. */
     @media (max-width: 430px) {
-      .video-brand span {
+      .video-brand span,
+      #videoSsid {
         display: none;
       }
     }
@@ -3215,6 +3237,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         </div>
 
         <div class="video-overlay video-telemetry">
+          <span id="videoSsid">--</span>
           <span id="videoFps">-- fps</span>
           <span id="videoRssi">-- dBm</span>
           <span id="videoMotion">STOP</span>
@@ -3641,6 +3664,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     const streamStatus = document.getElementById("streamStatus");
     const videoTelemetry = document.querySelector(".video-telemetry");
+    const videoSsid = document.getElementById("videoSsid");
     const videoFps = document.getElementById("videoFps");
     const videoRssi = document.getElementById("videoRssi");
     const videoMotion = document.getElementById("videoMotion");
@@ -3670,6 +3694,13 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       videoFps.textContent = (fps10 === null || fps10 === undefined)
         ? "-- fps"
         : ((fps10 / 10).toFixed(1) + " fps");
+    }
+
+    // Which network the picture is arriving over. This is identity, not an
+    // alarm: it stays at rest opacity and deliberately does not feed
+    // refreshTelemetryEmphasis(), which means "something needs you now".
+    function setVideoSsid(ssid) {
+      videoSsid.textContent = ssid || "--";
     }
 
     function setVideoRssi(rssi, valid) {
@@ -3702,6 +3733,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     function applyTelemetry(data) {
+      setVideoSsid(data.networkSsid);
       setVideoFps(data.streamActive ? data.streamFps10 : null);
       setVideoRssi(Number(data.rssi), Boolean(data.rssiValid));
 
@@ -6438,6 +6470,39 @@ static void sanitizeJsonText(char *text) {
   }
 }
 
+// Which network the robot is reachable on right now. One resolver for both
+// payloads: the Wi-Fi panel reads /status and the video overlay reads
+// /camera?stream=1, and the two must never disagree about which network the
+// picture is arriving over. ipOut may be NULL for callers that only want the
+// name. Both outputs come back already safe to paste into JSON.
+static void resolveNetworkIdentity(
+  char *ssidOut,
+  size_t ssidLen,
+  char *ipOut,
+  size_t ipLen
+) {
+  IPAddress ip(0, 0, 0, 0);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.SSID().toCharArray(ssidOut, ssidLen);
+    ip = WiFi.localIP();
+  } else if (fallbackApActive) {
+    strncpy(ssidOut, fallbackApSsid, ssidLen - 1);
+    ssidOut[ssidLen - 1] = '\0';
+    ip = WiFi.softAPIP();
+  } else {
+    strncpy(ssidOut, "(none)", ssidLen - 1);
+    ssidOut[ssidLen - 1] = '\0';
+  }
+
+  sanitizeJsonText(ssidOut);
+
+  if (ipOut) {
+    snprintf(ipOut, ipLen, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    sanitizeJsonText(ipOut);
+  }
+}
+
 static esp_err_t status_handler(httpd_req_t *req) {
   uint32_t afterId = 0;
 
@@ -6470,44 +6535,16 @@ static esp_err_t status_handler(httpd_req_t *req) {
   char robotIp[24] = "";
   const char *mode = networkModeName();
 
-  bool staConnected = (WiFi.status() == WL_CONNECTED);
   long rssi = 0;
   // Same source as the video overlay, so the panel and the picture cannot
   // disagree -- and so the reading is not "N/A" for everyone on the AP.
   bool rssiValid = currentLinkRssi(&rssi);
   unsigned int apClients = fallbackApActive ? WiFi.softAPgetStationNum() : 0;
 
-  if (staConnected) {
-    String staSsid = WiFi.SSID();
-    staSsid.toCharArray(networkSsid, sizeof(networkSsid));
-
-    IPAddress ip = WiFi.localIP();
-    snprintf(
-      robotIp,
-      sizeof(robotIp),
-      "%u.%u.%u.%u",
-      ip[0], ip[1], ip[2], ip[3]
-    );
-  } else if (fallbackApActive) {
-    strncpy(networkSsid, fallbackApSsid, sizeof(networkSsid) - 1);
-    networkSsid[sizeof(networkSsid) - 1] = '\0';
-
-    IPAddress ip = WiFi.softAPIP();
-    snprintf(
-      robotIp,
-      sizeof(robotIp),
-      "%u.%u.%u.%u",
-      ip[0], ip[1], ip[2], ip[3]
-    );
-  } else {
-    strncpy(networkSsid, "(none)", sizeof(networkSsid) - 1);
-    networkSsid[sizeof(networkSsid) - 1] = '\0';
-    strncpy(robotIp, "0.0.0.0", sizeof(robotIp) - 1);
-    robotIp[sizeof(robotIp) - 1] = '\0';
-  }
-
-  sanitizeJsonText(networkSsid);
-  sanitizeJsonText(robotIp);
+  resolveNetworkIdentity(
+    networkSsid, sizeof(networkSsid),
+    robotIp, sizeof(robotIp)
+  );
 
   // Room for the status fields plus retained debug events.
   const size_t JSON_SIZE = 12288;
@@ -6733,7 +6770,15 @@ static esp_err_t camera_handler(httpd_req_t *req) {
     long rssi = 0;
     bool rssiValid = currentLinkRssi(&rssi);
 
-    char body[224];
+    // The overlay names the network on the picture itself, and this probe --
+    // not /status -- is what feeds it.
+    char networkSsid[64] = "";
+    resolveNetworkIdentity(networkSsid, sizeof(networkSsid), NULL, 0);
+
+    // An SSID is up to 32 characters, so the worst case outgrew the 224 this
+    // used to be. A truncated body loses its closing brace, and the browser
+    // reads a robot that is answering perfectly well as offline.
+    char body[320];
 
     snprintf(
       body,
@@ -6741,7 +6786,7 @@ static esp_err_t camera_handler(httpd_req_t *req) {
       "{\"streamActive\":%s,\"streamFps10\":%lu,"
       "\"rssi\":%ld,\"rssiValid\":%s,"
       "\"motion\":\"%s\",\"left\":%d,\"right\":%d,"
-      "\"motionTimeouts\":%lu}",
+      "\"motionTimeouts\":%lu,\"networkSsid\":\"%s\"}",
       streamClientActive ? "true" : "false",
       (unsigned long)streamFps10,
       rssi,
@@ -6749,7 +6794,8 @@ static esp_err_t camera_handler(httpd_req_t *req) {
       motionName(motionState),
       currentLeftPWM,
       currentRightPWM,
-      (unsigned long)motionTimeoutCount
+      (unsigned long)motionTimeoutCount,
+      networkSsid
     );
 
     httpd_resp_set_type(req, "application/json");
