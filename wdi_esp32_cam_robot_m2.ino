@@ -365,15 +365,24 @@ static void logWiFiStatus(const char *prefix, wl_status_t status) {
 
 static void makeFallbackApName() {
   // Use the last 4 hex digits of the ESP32 eFuse MAC so multiple classroom
-  // robots get distinct SSIDs, for example ESP32-Robot-F8B4.
+  // robots get distinct SSIDs, for example ESP32-Robot-57AC.
+  //
+  // ESP.getEfuseMac() packs the six MAC bytes little-endian, so mac[0] -- the
+  // first byte of the vendor OUI -- lands in the LOW bits of the value.
+  // Masking 0xFFFF therefore named the board after Espressif rather than
+  // after itself: every ESP32-CAM sharing an OUI came up as the same
+  // ESP32-Robot-AA8C, which is precisely the collision this is meant to
+  // avoid. The half of the address that is unique per board is at the top.
   uint64_t chipId = ESP.getEfuseMac();
-  uint16_t suffix = (uint16_t)(chipId & 0xFFFF);
+  uint8_t macByte4 = (uint8_t)((chipId >> 32) & 0xFF);
+  uint8_t macByte5 = (uint8_t)((chipId >> 40) & 0xFF);
 
   snprintf(
     fallbackApSsid,
     sizeof(fallbackApSsid),
-    "ESP32-Robot-%04X",
-    suffix
+    "ESP32-Robot-%02X%02X",
+    macByte4,
+    macByte5
   );
 }
 
@@ -405,8 +414,9 @@ static bool startFallbackAccessPoint() {
   snprintf(
     dbg,
     sizeof(dbg),
-    "BOOT: Fallback AP started; SSID %s",
-    fallbackApSsid
+    "BOOT: Fallback AP started; SSID %s from base MAC %s",
+    fallbackApSsid,
+    WiFi.macAddress().c_str()
   );
   setDebugMessage(dbg);
 
@@ -1020,6 +1030,11 @@ static void printSerialRobotStatus() {
                 ledBrightness);
   Serial.printf("  network mode : %s\n", networkModeName());
   Serial.printf("  STA status   : %s\n", wifiStatusName(WiFi.status()));
+  // The fallback SSID is built from the last two bytes of this address.
+  // Printed because it is otherwise unobtainable from the robot: checking
+  // that the name matches the hardware meant reading the BSSID from a
+  // connected client and undoing the SoftAP's +1 by hand.
+  Serial.printf("  base MAC     : %s\n", WiFi.macAddress().c_str());
 
   if (WiFi.status() == WL_CONNECTED) {
     IPAddress ip = WiFi.localIP();
