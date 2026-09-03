@@ -20,7 +20,7 @@ A Wi-Fi controlled ESP32-CAM robot with live camera streaming, independent motor
   - Enabling Sync uses the current left motor value as the initial reference.
 - Short full-power startup kick to help overcome motor stiction.
 - Forward, left, right, and stop controls.
-- The PCB now uses a TB6612FNG H-bridge. This firmware keeps the existing forward/left/right/stop browser controls; the motor layer is ready for bidirectional extension.
+- The PCB uses a TB6612FNG H-bridge, and the browser controls are forward, backward, left, right, and stop. Reverse drives the opposite direction input; the wheels are always brought to a stop before crossing between forward and reverse.
 
 ### Hold to drive, and the motion timeout
 
@@ -55,7 +55,7 @@ The schematic uses a **TB6612FNG** dual H-bridge module (SparkFun ROB-14450). It
 - PWMA + PWMB: GPIO12 held high
 - STBY: tied to +5V
 
-The TB6612FNG is bidirectional hardware. The current web UI still exposes forward, left, right, and stop; adding a reverse command only requires driving the opposite IN pin with PWM.
+The TB6612FNG is bidirectional hardware, and both directions are used: forward puts PWM on IN1 and holds IN2 idle, reverse does the opposite. All four direction pins are written with `analogWrite`, never `digitalWrite` -- once LEDC drives a pin through the GPIO matrix a `digitalWrite` on it is silently ignored.
 
 ## Camera
 

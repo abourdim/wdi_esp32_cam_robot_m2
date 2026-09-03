@@ -241,16 +241,24 @@ static int leftThreshold = 0;
 static int rightThreshold = 0;
 
 static const int START_KICK_MS = 120;  // brief boost when starting a motor from rest
+// Wheels are let go before they are asked to turn the other way. Slamming a
+// loaded geared motor from full speed into the opposite direction punishes
+// the gearbox and drags a current spike through a supply that already
+// brownout-resets this board.
+static const int DIRECTION_CHANGE_PAUSE_MS = 60;
 
 volatile int leftMotorSpeed = 220;
 volatile int rightMotorSpeed = 220;
 
 int currentLeftPWM = 0;
 int currentRightPWM = 0;
+// Which way the last write drove the wheels, so a reversal can be spotted.
+bool currentReverse = false;
 
 enum MotionState {
   MOTION_STOPPED,
   MOTION_FORWARD,
+  MOTION_BACKWARD,
   MOTION_LEFT,
   MOTION_RIGHT
 };
@@ -279,6 +287,7 @@ portMUX_TYPE debugMux = portMUX_INITIALIZER_UNLOCKED;
 static const char *motionName(MotionState state) {
   switch (state) {
     case MOTION_FORWARD: return "FORWARD";
+    case MOTION_BACKWARD: return "BACKWARD";
     case MOTION_LEFT:    return "LEFT";
     case MOTION_RIGHT:   return "RIGHT";
     case MOTION_STOPPED:
@@ -672,19 +681,37 @@ static void serviceHeartbeat() {
   ledcWrite(LED_LEDC_CHANNEL, duty);
 }
 
-static void writeTb6612Forward(int in1Pin, int in2Pin, int pwm) {
+static void writeTb6612(int in1Pin, int in2Pin, int pwm, bool reverse) {
   pwm = clampMotorPWM(pwm);
 
-  // Shared PWMA/PWMB is held high. For forward motion, IN2 stays low and
-  // IN1 receives PWM. This gives each motor independent speed even though
-  // both TB6612 PWM-enable inputs are tied to GPIO12 in the schematic.
-  digitalWrite(in2Pin, LOW);
-  analogWrite(in1Pin, pwm);
+  // Shared PWMA/PWMB is held high, so direction is chosen by which of the two
+  // direction inputs carries the PWM: IN1 drives the wheel forward, IN2
+  // drives it back. Each motor keeps independent speed even though both
+  // TB6612 PWM-enable inputs are tied to GPIO12 in the schematic.
+  const int drivePin = reverse ? in2Pin : in1Pin;
+  const int idlePin = reverse ? in1Pin : in2Pin;
+
+  // Both pins go through analogWrite deliberately. Reverse attaches LEDC to
+  // the IN2 pins as well, and once the GPIO matrix is driving a pin from
+  // LEDC a later digitalWrite on it never reaches the output -- the wheel
+  // would keep turning with no visible reason why. Idle pin first, so the
+  // pair is never momentarily both-high, which is the TB6612's brake state.
+  analogWrite(idlePin, 0);
+  analogWrite(drivePin, pwm);
 }
 
-static void writeMotors(int leftPWM, int rightPWM) {
+static void writeMotors(int leftPWM, int rightPWM, bool reverse) {
   leftPWM = clampMotorPWM(leftPWM);
   rightPWM = clampMotorPWM(rightPWM);
+
+  // Turning wheels are stopped before they are asked to run the other way.
+  // Stopping also zeroes the PWM state below, so the new direction starts
+  // from rest and earns its stiction kick.
+  if (reverse != currentReverse &&
+      (currentLeftPWM > 0 || currentRightPWM > 0)) {
+    stopMotors();
+    delay(DIRECTION_CHANGE_PAUSE_MS);
+  }
 
   // A motor that starts from zero gets a short full-power kick.
   // The exact requested PWM (0..255) is applied immediately afterward.
@@ -692,26 +719,29 @@ static void writeMotors(int leftPWM, int rightPWM) {
   bool kickRight = (currentRightPWM == 0 && rightPWM > 0);
 
   if (kickLeft || kickRight) {
-    writeTb6612Forward(MOTOR_L_IN1_PIN, MOTOR_L_IN2_PIN,
-                       kickLeft ? maxMotorPWM : leftPWM);
-    writeTb6612Forward(MOTOR_R_IN1_PIN, MOTOR_R_IN2_PIN,
-                       kickRight ? maxMotorPWM : rightPWM);
+    writeTb6612(MOTOR_L_IN1_PIN, MOTOR_L_IN2_PIN,
+                kickLeft ? maxMotorPWM : leftPWM, reverse);
+    writeTb6612(MOTOR_R_IN1_PIN, MOTOR_R_IN2_PIN,
+                kickRight ? maxMotorPWM : rightPWM, reverse);
     delay(START_KICK_MS);
   }
 
-  writeTb6612Forward(MOTOR_L_IN1_PIN, MOTOR_L_IN2_PIN, leftPWM);
-  writeTb6612Forward(MOTOR_R_IN1_PIN, MOTOR_R_IN2_PIN, rightPWM);
+  writeTb6612(MOTOR_L_IN1_PIN, MOTOR_L_IN2_PIN, leftPWM, reverse);
+  writeTb6612(MOTOR_R_IN1_PIN, MOTOR_R_IN2_PIN, rightPWM, reverse);
 
   currentLeftPWM = leftPWM;
   currentRightPWM = rightPWM;
+  currentReverse = reverse;
 }
 
 static void stopMotors() {
-  // TB6612 stop state: both direction inputs low. PWMA/PWMB remain enabled.
+  // TB6612 stop state: both direction inputs idle. PWMA/PWMB remain enabled.
+  // analogWrite on all four, not digitalWrite: the IN2 pins are LEDC-driven
+  // once reverse has been used, and a digitalWrite would not reach them.
   analogWrite(MOTOR_L_IN1_PIN, 0);
-  digitalWrite(MOTOR_L_IN2_PIN, LOW);
+  analogWrite(MOTOR_L_IN2_PIN, 0);
   analogWrite(MOTOR_R_IN1_PIN, 0);
-  digitalWrite(MOTOR_R_IN2_PIN, LOW);
+  analogWrite(MOTOR_R_IN2_PIN, 0);
   currentLeftPWM = 0;
   currentRightPWM = 0;
 }
@@ -722,15 +752,19 @@ static void applyMotion() {
 
   switch (motionState) {
     case MOTION_FORWARD:
-      writeMotors(leftNow, rightNow);
+      writeMotors(leftNow, rightNow, false);
+      break;
+
+    case MOTION_BACKWARD:
+      writeMotors(leftNow, rightNow, true);
       break;
 
     case MOTION_LEFT:
-      writeMotors(0, rightNow);
+      writeMotors(0, rightNow, false);
       break;
 
     case MOTION_RIGHT:
-      writeMotors(leftNow, 0);
+      writeMotors(leftNow, 0, false);
       break;
 
     case MOTION_STOPPED:
@@ -754,6 +788,12 @@ static void noteMotionCommand() {
 static void moveForward() {
   noteMotionCommand();
   motionState = MOTION_FORWARD;
+  applyMotion();
+}
+
+static void moveBackward() {
+  noteMotionCommand();
+  motionState = MOTION_BACKWARD;
   applyMotion();
 }
 
@@ -2288,11 +2328,6 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       color: #111;
     }
 
-    .backward {
-      opacity: 0.35;
-      cursor: not-allowed;
-    }
-
     .note {
       margin: 14px 0 0;
       padding: 10px 12px;
@@ -3347,12 +3382,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         <button class="button stop" id="stopButton" type="button" aria-label="Stop">●</button>
         <button class="button right drive" data-action="right" aria-label="Right">→</button>
 
-        <button
-          class="button backward"
-          type="button"
-          disabled
-          title="Reverse UI is not enabled in this build"
-          aria-label="Reverse not enabled">↓</button>
+        <button class="button backward drive" data-action="backward" aria-label="Backward">↓</button>
       </div>
 
       <div class="note">
@@ -7266,12 +7296,15 @@ static esp_err_t action_handler(httpd_req_t *req) {
 
     if (strcmp(value, "forward") == 0) {
       requested = MOTION_FORWARD;
+    } else if (strcmp(value, "backward") == 0) {
+      requested = MOTION_BACKWARD;
     } else if (strcmp(value, "left") == 0) {
       requested = MOTION_LEFT;
     } else if (strcmp(value, "right") == 0) {
       requested = MOTION_RIGHT;
     }
-    // Anything else, unsupported commands such as backward included, stops.
+    // Anything else stops, so an unknown command can never leave a wheel
+    // turning.
 
     if (requested == motionState) {
       // A repeat of the state we are already in: the keepalive a held button
@@ -7287,6 +7320,10 @@ static esp_err_t action_handler(httpd_req_t *req) {
     } else if (requested == MOTION_FORWARD) {
       setDebugMessage("Command: FORWARD");
       moveForward();
+
+    } else if (requested == MOTION_BACKWARD) {
+      setDebugMessage("Command: BACKWARD");
+      moveBackward();
 
     } else if (requested == MOTION_LEFT) {
       setDebugMessage("Command: LEFT");
