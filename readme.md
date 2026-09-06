@@ -18,7 +18,7 @@ A Wi-Fi controlled ESP32-CAM robot with live camera streaming, independent motor
 - **Sync motors** checkbox:
   - When enabled, changing either motor changes both motors to the same PWM value.
   - Enabling Sync uses the current left motor value as the initial reference.
-- Short full-power startup kick to help overcome motor stiction.
+- Gentle PWM soft start that ramps only to the requested motor PWM.
 - Forward, left, right, and stop controls.
 - The PCB uses a TB6612FNG H-bridge, and the browser controls are forward, backward, left, right, and stop. Reverse drives the opposite direction input; the wheels are always brought to a stop before crossing between forward and reverse.
 
@@ -52,10 +52,10 @@ The schematic uses a **TB6612FNG** dual H-bridge module (SparkFun ROB-14450). It
 
 - Motor A / J6 (left): AIN1 = GPIO2 (PWM), AIN2 = GPIO13 (low for forward)
 - Motor B / J7 (right): BIN1 = GPIO15 (PWM), BIN2 = GPIO14 (low for forward)
-- PWMA + PWMB: GPIO12 held high
+- PWMA + PWMB: GPIO12 high while moving, low while stopped
 - STBY: tied to +5V
 
-The TB6612FNG is bidirectional hardware, and both directions are used: forward puts PWM on IN1 and holds IN2 idle, reverse does the opposite. All four direction pins are written with `analogWrite`, never `digitalWrite` -- once LEDC drives a pin through the GPIO matrix a `digitalWrite` on it is silently ignored.
+The TB6612FNG is bidirectional hardware, and both directions are used: forward puts PWM on IN1 and holds IN2 idle, reverse does the opposite. All four direction pins use fixed low-speed LEDC channels: the right motor on 10-11 and the left motor on 12-13. The channel number is not free choice -- the Arduino core derives the group and timer from it as `group = chan / 8` and `timer = (chan / 2) % 4`, and `esp_camera_init()` reprograms low-speed timer 0 to 20 MHz at 1-bit resolution for XCLK. Channels 8 and 9 land on that timer, so the left motor used to lose its 8-bit duty resolution the moment the camera came up: every non-zero `ledcWrite()` saturated and pinned the pin HIGH, defeating the soft start and browning the board out on the first left-motor command. `static_assert`s on the channel numbers and a `verifyMotorLedcTimers()` read-back after every camera init now hold that line.
 
 ## Camera
 
@@ -306,9 +306,9 @@ Settings -> Robot:
 - **Name** -- shown in the header and the browser tab, and used for photo and
   log filenames. Stored on the robot, so every browser sees the same name.
 - **Speed limit** -- a ceiling on motor PWM, enforced in the firmware rather
-  than the browser, so it holds however the command arrives. The startup kick
-  respects it too. Anything already above a new ceiling is brought down to it
-  immediately.
+  than the browser, so it holds however the command arrives. The soft-start
+  ramp never exceeds the requested value or this ceiling. Anything already
+  above a new ceiling is brought down to it immediately.
 
 ## Saved settings
 
@@ -356,7 +356,7 @@ overwrites a control you have already touched in that session.
 ## Editing the web UI
 
 The whole browser UI is one raw string literal, `INDEX_HTML`, inside
-`wdi_esp32_cam_robot_m1.ino`, so the sketch still opens in the Arduino IDE with
+`wdi_esp32_cam_robot_m2.ino`, so the sketch still opens in the Arduino IDE with
 no extra steps.
 
 That literal is about 70 KB, and it travels over the same Wi-Fi link as the

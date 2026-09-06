@@ -11,8 +11,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKETCH="wdi_esp32_cam_robot_m1.ino"
+SKETCH="wdi_esp32_cam_robot_m2.ino"
 PIO_ENV="esp32cam"
+PIO_DEBUG_ENV="esp32cam-debug"
 FIRMWARE_BIN="$SCRIPT_DIR/.pio/build/$PIO_ENV/firmware.bin"
 EXPORT_DIR="$SCRIPT_DIR/export"
 
@@ -317,6 +318,44 @@ build_flash_monitor() {
   esac
 }
 
+debug_build_flash_monitor() {
+  echo
+  warn "DEBUG MODE: this flashes a symbol-rich diagnostic build."
+  warn "Use it only while reproducing a crash; option 5 restores the normal build."
+  echo
+  info "Building debug firmware ($PIO_DEBUG_ENV)..."
+  if ! pio_run run -e "$PIO_DEBUG_ENV" -d "$SCRIPT_DIR"; then
+    err "Debug build failed -- see output above."
+    pause
+    return
+  fi
+
+  warn "To flash: jumper GPIO0 to GND, reset/power-cycle, then start upload."
+  warn "Remove the GPIO0 jumper and reset again after upload completes."
+  pick_port
+
+  info "Flashing debug firmware..."
+  if [ -n "$SELECTED_PORT" ]; then
+    pio_run run -e "$PIO_DEBUG_ENV" -t upload --upload-port "$SELECTED_PORT" -d "$SCRIPT_DIR" || { err "Debug flash failed."; pause; return; }
+  else
+    pio_run run -e "$PIO_DEBUG_ENV" -t upload -d "$SCRIPT_DIR" || { err "Debug flash failed."; pause; return; }
+  fi
+
+  ok "Debug firmware flashed."
+  info "Opening exception-decoding serial monitor at 115200 baud."
+  if ! find_pio; then
+    err "PlatformIO disappeared from PATH."
+    pause
+    return
+  fi
+
+  if [ -n "$SELECTED_PORT" ]; then
+    (cd "$SCRIPT_DIR" && "$PIO_BIN" device monitor -e "$PIO_DEBUG_ENV" -b 115200 -p "$SELECTED_PORT")
+  else
+    (cd "$SCRIPT_DIR" && "$PIO_BIN" device monitor -e "$PIO_DEBUG_ENV" -b 115200)
+  fi
+}
+
 main_menu() {
   while true; do
     clear 2>/dev/null || true
@@ -342,6 +381,7 @@ main_menu() {
     echo "  7) List serial ports"
     echo "  8) Clean build"
     echo "  9) Flash over WiFi (OTA)"
+    echo "  d) Debug build + Flash + Monitor"
     echo "  x) Export .bin for the browser uploader"
     echo "  q) Quit"
     echo
@@ -356,6 +396,7 @@ main_menu() {
       7) list_ports ;;
       8) clean_firmware ;;
       9) ota_flash ;;
+      d|D) debug_build_flash_monitor ;;
       x|X) export_bin ;;
       q|Q) echo; info "Bye."; exit 0 ;;
       *) warn "Unrecognized option." ; sleep 1 ;;

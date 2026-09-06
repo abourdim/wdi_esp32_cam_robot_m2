@@ -107,7 +107,7 @@
 <p>  - When enabled, changing either motor changes both motors to the same PWM value.</p>
 <p>  - Enabling Sync uses the current left motor value as the initial reference.</p>
 <ul>
-<li>Short full-power startup kick to help overcome motor stiction.</li>
+<li>Gentle PWM soft start that ramps only to the requested motor PWM.</li>
 <li>Forward, left, right, and stop controls.</li>
 <li>The PCB uses a TB6612FNG H-bridge. This firmware keeps the existing forward/left/right/stop browser controls; the motor layer is ready for bidirectional extension.</li>
 </ul>
@@ -138,7 +138,7 @@
 <ul>
 <li>Motor A / J6 (left): AIN1 = GPIO2 (PWM), AIN2 = GPIO13 (low for forward)</li>
 <li>Motor B / J7 (right): BIN1 = GPIO15 (PWM), BIN2 = GPIO14 (low for forward)</li>
-<li>PWMA + PWMB: GPIO12 held high</li>
+<li>PWMA + PWMB: GPIO12 high while moving, low while stopped</li>
 <li>STBY: tied to +5V</li>
 </ul>
 
@@ -317,7 +317,7 @@
 
 <ul>
 <li><strong>Name</strong> -- shown in the header and the browser tab, and used for photo and log filenames. Stored on the robot, so every browser sees the same name.</li>
-<li><strong>Speed limit</strong> -- a ceiling on motor PWM, enforced in the firmware rather than the browser, so it holds however the command arrives. The startup kick respects it too. Anything already above a new ceiling is brought down to it immediately.</li>
+<li><strong>Speed limit</strong> -- a ceiling on motor PWM, enforced in the firmware rather than the browser, so it holds however the command arrives. The soft-start ramp never exceeds the requested value or the configured ceiling. Anything already above a new ceiling is brought down to it immediately.</li>
 </ul>
 
 <h2>Saved settings</h2>
@@ -350,7 +350,7 @@
 
 <h2>Editing the web UI</h2>
 
-<p>The whole browser UI is one raw string literal, <code>INDEX_HTML</code>, inside <code>wdi_esp32_cam_robot_m1.ino</code>, so the sketch still opens in the Arduino IDE with no extra steps.</p>
+<p>The whole browser UI is one raw string literal, <code>INDEX_HTML</code>, inside <code>wdi_esp32_cam_robot_m2.ino</code>, so the sketch still opens in the Arduino IDE with no extra steps.</p>
 
 <p>That literal is about 70 KB, and it travels over the same Wi-Fi link as the video. The firmware therefore serves a gzipped copy of it -- about 15 KB -- which is generated into <code>index_html_gz.h</code> by:</p>
 
