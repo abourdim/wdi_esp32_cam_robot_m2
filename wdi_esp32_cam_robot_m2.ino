@@ -2865,6 +2865,23 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     /* Only ever written to when the light cannot do what the button says. */
+    .torch-canvas {
+      display: block;
+      width: 100%;
+      height: 56px;
+      margin: 12px 0 6px;
+      border-radius: 10px;
+      background: #111;
+    }
+
+    .torch-readout {
+      margin-bottom: 12px;
+      color: #667085;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      text-align: center;
+    }
+
     .light-note {
       width: min(100%, 274px);
       margin: 8px auto 0;
@@ -3445,6 +3462,8 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
                 role="tab" aria-selected="true">Drive</button>
         <button id="tabProgram" class="hero-tab" type="button"
                 role="tab" aria-selected="false">Program</button>
+        <button id="tabGames" class="hero-tab" type="button"
+                role="tab" aria-selected="false">Games</button>
       </div>
 
       <div class="hero-right">
@@ -4044,6 +4063,36 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       </div>
     </div>
   </div>
+
+    <div id="gamesView" class="panel" hidden>
+      <div class="program-head">
+        <strong>Follow the torch</strong>
+        <span id="torchState" class="program-count">not running</span>
+      </div>
+
+      <div class="note">
+        This robot has no light sensor, so the camera is the sensor. Four times
+        a second it takes a picture, reads one strip across the middle, and
+        turns towards whichever side is brighter. Dim the room, shine a phone
+        torch at it, and walk backwards.
+      </div>
+
+      <canvas id="torchCanvas" class="torch-canvas" width="256" height="56"
+              aria-label="The strip the robot is looking at"></canvas>
+
+      <div id="torchReadout" class="torch-readout">left --  |  right --</div>
+
+      <div class="program-buttons">
+        <button id="torchButton" class="slot-button" type="button">Start</button>
+      </div>
+
+      <div class="note">
+        The strip above is exactly what it is deciding from, brightest as
+        white. The shaded half is the way it chose to turn. If it drives away
+        from the torch instead of towards it, the picture is mirrored: turn
+        off Mirror in Settings, or tick a wheel under Wheel direction.
+      </div>
+    </div>
 
   <div id="galleryModal" class="modal" hidden>
     <div class="modal-card">
@@ -5911,12 +5960,22 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // losing focus mid-press, the tab being hidden, the page going away.
     // A running program drives the robot exactly as a held button does, so
     // everything that ends a drive ends a replay too.
-    window.addEventListener("blur", () => { stopPlayback(); endDrive(); });
-    window.addEventListener("pagehide", () => { stopPlayback(); endDrive(); });
+    window.addEventListener("blur", () => {
+      stopPlayback();
+      stopTorch("window lost focus");
+      endDrive();
+    });
+
+    window.addEventListener("pagehide", () => {
+      stopPlayback();
+      stopTorch("page closed");
+      endDrive();
+    });
 
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
         stopPlayback();
+        stopTorch("tab hidden");
         endDrive();
       }
     });
@@ -5937,8 +5996,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     const tabDrive = document.getElementById("tabDrive");
     const tabProgram = document.getElementById("tabProgram");
+    const tabGames = document.getElementById("tabGames");
     const driveView = document.getElementById("driveView");
     const programView = document.getElementById("programView");
+    const gamesView = document.getElementById("gamesView");
     const recordButton = document.getElementById("recordButton");
     const recordLabel = document.getElementById("recordLabel");
     const programStatus = document.getElementById("programStatus");
@@ -6282,25 +6343,207 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       });
     });
 
+
+    // ---- Games: follow the torch ------------------------------------------
+    // The robot has no light sensor, so the camera is the sensor: read one
+    // strip of a frame and steer towards whichever half is brighter.
+    //
+    // Frames come from /capture on port 80, not the stream on 81. The stream
+    // is a different origin, which taints a canvas and makes getImageData
+    // throw -- so the obvious source is the one that cannot work.
+    //
+    // Every command goes out through sendAction() at the cadence a held
+    // button already uses, so the game drives the robot exactly as a child
+    // does and is governed by the same motion timeout. It cannot ask for
+    // anything a finger could not.
+
+    const torchCanvas = document.getElementById("torchCanvas");
+    const torchReadout = document.getElementById("torchReadout");
+    const torchButton = document.getElementById("torchButton");
+    const torchState = document.getElementById("torchState");
+
+    const TORCH_TICK_MS = 250;
+    const TORCH_W = 64;
+    const TORCH_H = 48;
+    const TORCH_DARK = 40;    // below this there is nothing worth chasing
+    const TORCH_MARGIN = 10;  // difference before it bothers turning
+
+    let torchRunning = false;
+    let torchTimer = null;
+    let torchBusy = false;
+
+    const torchWork = document.createElement("canvas");
+    torchWork.width = TORCH_W;
+    torchWork.height = TORCH_H;
+
+    const torchWorkCtx =
+      torchWork.getContext("2d", { willReadFrequently: true });
+    const torchViewCtx = torchCanvas.getContext("2d");
+
+    function torchGrab() {
+      return new Promise((resolve, reject) => {
+        const frame = new Image();
+        frame.onload = () => resolve(frame);
+        frame.onerror = () => reject(new Error("no frame"));
+        // Without the buster a browser hands back the frame it already has.
+        frame.src = "/capture?t=" + Date.now();
+      });
+    }
+
+    function torchAnalyse(frame) {
+      torchWorkCtx.drawImage(frame, 0, 0, TORCH_W, TORCH_H);
+
+      // A band across the middle: the floor immediately ahead is mostly the
+      // robot's own shadow, and the ceiling is where the room lights are.
+      const top = Math.round(TORCH_H * 0.38);
+      const rows = Math.max(1, Math.round(TORCH_H * 0.34));
+      const band = torchWorkCtx.getImageData(0, top, TORCH_W, rows);
+
+      const columns = new Array(TORCH_W).fill(0);
+
+      for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < TORCH_W; x++) {
+          const i = (y * TORCH_W + x) * 4;
+          // Rec. 601 luma. A torch and a lamp are both white, so plain
+          // brightness is all this needs.
+          columns[x] +=
+            0.299 * band.data[i] +
+            0.587 * band.data[i + 1] +
+            0.114 * band.data[i + 2];
+        }
+      }
+
+      let left = 0;
+      let right = 0;
+      const half = TORCH_W >> 1;
+
+      for (let x = 0; x < TORCH_W; x++) {
+        columns[x] /= rows;
+        if (x < half) left += columns[x]; else right += columns[x];
+      }
+
+      left /= half;
+      right /= (TORCH_W - half);
+
+      return { columns, left, right, brightest: Math.max(left, right) };
+    }
+
+    function torchDecide(sample) {
+      if (sample.brightest < TORCH_DARK) return "stop";
+      if (sample.left - sample.right > TORCH_MARGIN) return "left";
+      if (sample.right - sample.left > TORCH_MARGIN) return "right";
+      return "forward";
+    }
+
+    // The whole point of the game: the child watches the robot think.
+    function torchDraw(sample, action) {
+      const width = torchCanvas.width;
+      const height = torchCanvas.height;
+      const columnWidth = width / TORCH_W;
+
+      for (let x = 0; x < TORCH_W; x++) {
+        const value = Math.max(0, Math.min(255, Math.round(sample.columns[x])));
+        torchViewCtx.fillStyle =
+          "rgb(" + value + "," + value + "," + value + ")";
+        torchViewCtx.fillRect(x * columnWidth, 0, columnWidth + 1, height);
+      }
+
+      if (action === "left" || action === "right") {
+        torchViewCtx.fillStyle = "rgba(233, 185, 0, 0.32)";
+        torchViewCtx.fillRect(
+          action === "left" ? 0 : width / 2, 0, width / 2, height
+        );
+      }
+    }
+
+    function torchTick() {
+      // A slow frame must not stack ticks behind it.
+      if (!torchRunning || torchBusy) return;
+      torchBusy = true;
+
+      torchGrab().then((frame) => {
+        if (!torchRunning) return;
+
+        const sample = torchAnalyse(frame);
+        const action = torchDecide(sample);
+
+        torchDraw(sample, action);
+        sendAction(action);
+
+        torchReadout.textContent =
+          "left " + Math.round(sample.left) +
+          "  |  right " + Math.round(sample.right) +
+          "  →  " + action;
+
+        torchState.textContent =
+          action === "stop" ? "looking for a light" : "chasing";
+      }).catch(() => {
+        stopTorch("could not read a frame");
+      }).then(() => {
+        torchBusy = false;
+      });
+    }
+
+    function startTorch() {
+      if (torchRunning) return;
+
+      torchRunning = true;
+      torchButton.textContent = "Stop";
+      torchState.textContent = "starting";
+      torchTimer = setInterval(torchTick, TORCH_TICK_MS);
+      torchTick();
+    }
+
+    function stopTorch(why) {
+      if (!torchRunning) return;
+
+      torchRunning = false;
+      clearInterval(torchTimer);
+      torchTimer = null;
+
+      // Always leave the robot stopped, however the game ended.
+      sendAction("stop");
+
+      torchButton.textContent = "Start";
+      torchState.textContent = why || "not running";
+    }
+
+    torchButton.addEventListener("click", () => {
+      if (torchRunning) stopTorch(); else startTorch();
+    });
+
     // ---- Views ------------------------------------------------------------
     // The video stays above both views, so a program can be watched running.
 
     function showView(view) {
-      const wantsProgram = view === "program";
+      const wanted =
+        (view === "program" || view === "games") ? view : "drive";
 
-      driveView.hidden = wantsProgram;
-      programView.hidden = !wantsProgram;
+      driveView.hidden = wanted !== "drive";
+      programView.hidden = wanted !== "program";
+      gamesView.hidden = wanted !== "games";
 
-      tabDrive.classList.toggle("is-active", !wantsProgram);
-      tabProgram.classList.toggle("is-active", wantsProgram);
-      tabDrive.setAttribute("aria-selected", String(!wantsProgram));
-      tabProgram.setAttribute("aria-selected", String(wantsProgram));
+      const tabs = [
+        [tabDrive, "drive"],
+        [tabProgram, "program"],
+        [tabGames, "games"]
+      ];
 
-      prefSet("View", view);
+      tabs.forEach(([tab, name]) => {
+        tab.classList.toggle("is-active", wanted === name);
+        tab.setAttribute("aria-selected", String(wanted === name));
+      });
+
+      // Leaving the tab is a release like any other: a game that drives the
+      // robot must not keep driving it from a view nobody is looking at.
+      if (wanted !== "games") stopTorch("left the Games tab");
+
+      prefSet("View", wanted);
     }
 
     tabDrive.addEventListener("click", () => showView("drive"));
     tabProgram.addEventListener("click", () => showView("program"));
+    tabGames.addEventListener("click", () => showView("games"));
 
 
     // ---- Robot identity and limits ---------------------------------------
