@@ -4140,6 +4140,42 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
           all, and the answer is zero.
         </div>
       </div>
+
+      <div class="game-card">
+        <div class="program-head">
+          <strong>Follow the line</strong>
+          <span id="lineState" class="program-count">not running</span>
+        </div>
+
+        <div class="note">
+          Lay a line of dark tape across a pale floor. The robot reads a strip
+          along the bottom of the picture -- the floor just in front of its
+          wheels -- finds the darkest part of it, and steers to keep that in
+          the middle.
+        </div>
+
+        <canvas id="lineCanvas" class="torch-canvas" width="256" height="56"
+                aria-label="The floor strip the robot is following"></canvas>
+
+        <div id="lineReadout" class="torch-readout">no line yet</div>
+
+        <div class="program-buttons">
+          <button id="lineButton" class="slot-button" type="button">Start</button>
+        </div>
+
+        <label class="sync-control">
+          <input id="lineInvert" type="checkbox">
+          Pale line on a dark floor
+        </label>
+
+        <div class="note">
+          The mark shows where it thinks the line is. When it cannot tell the
+          line from the floor it stops rather than guessing, and more light or
+          more contrast between tape and floor will fix that faster than
+          anything on this page. Turn the Speed down first: fast is how a line
+          follower loses the corner.
+        </div>
+      </div>
     </div>
 
   <div id="galleryModal" class="modal" hidden>
@@ -6012,6 +6048,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       stopPlayback();
       stopTorch("window lost focus");
       stopSpin("window lost focus");
+      stopLine("window lost focus");
       endDrive();
     });
 
@@ -6019,6 +6056,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       stopPlayback();
       stopTorch("page closed");
       stopSpin("page closed");
+      stopLine("page closed");
       endDrive();
     });
 
@@ -6027,6 +6065,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         stopPlayback();
         stopTorch("tab hidden");
         stopSpin("tab hidden");
+        stopLine("tab hidden");
         endDrive();
       }
     });
@@ -6445,11 +6484,14 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // frame. Both games read the same band: the floor right in front is
     // mostly the robot's own shadow, and the ceiling is where the room
     // lights are.
-    function sampleColumns(frame) {
+    function sampleColumns(frame, topFraction, heightFraction) {
       torchWorkCtx.drawImage(frame, 0, 0, TORCH_W, TORCH_H);
 
-      const top = Math.round(TORCH_H * 0.38);
-      const rows = Math.max(1, Math.round(TORCH_H * 0.34));
+      const top = Math.round(TORCH_H * (topFraction === undefined ? 0.38 : topFraction));
+      const rows = Math.max(
+        1,
+        Math.round(TORCH_H * (heightFraction === undefined ? 0.34 : heightFraction))
+      );
       const band = torchWorkCtx.getImageData(0, top, TORCH_W, rows);
 
       const columns = new Array(TORCH_W).fill(0);
@@ -6573,6 +6615,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         stopTorch();
       } else {
         stopSpin("stopped");
+        stopLine("chasing the torch instead");
         startTorch();
       }
     });
@@ -6687,8 +6730,9 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     async function runSpin() {
-      // The two games drive the same robot; only one may have it.
+      // The games drive the same robot; only one may have it.
       stopTorch("measuring instead");
+      stopLine("measuring instead");
 
       spinRunning = true;
       spinButton.textContent = "Stop";
@@ -6732,6 +6776,186 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       if (spinRunning) stopSpin("stopped"); else runSpin();
     });
 
+
+    // ---- Games: follow the line --------------------------------------------
+    // Same camera-as-sensor trick as the torch, but reading a strip along the
+    // bottom of the frame -- the floor just in front of the wheels -- and
+    // steering to keep the darkest part of it centred.
+    //
+    // The threshold is relative to the brightest and darkest column in that
+    // strip rather than a fixed number, so it works on a grey floor in a dim
+    // room as well as on white paper under a lamp. When the two are too close
+    // together to tell apart it stops instead of inventing a line.
+
+    const lineCanvas = document.getElementById("lineCanvas");
+    const lineReadout = document.getElementById("lineReadout");
+    const lineButton = document.getElementById("lineButton");
+    const lineState = document.getElementById("lineState");
+    const lineInvert = document.getElementById("lineInvert");
+
+    const LINE_TICK_MS = 250;
+    const LINE_BAND_TOP = 0.70;
+    const LINE_BAND_HEIGHT = 0.22;
+    const LINE_CONTRAST = 22;   // darkest to brightest, below this there is no line
+    const LINE_SHARE = 0.4;     // how far down that range still counts as line
+    const LINE_DEADZONE = 5;    // columns either side of centre that count as straight
+
+    let lineRunning = false;
+    let lineTimer = null;
+    let lineBusy = false;
+
+    const lineViewCtx = lineCanvas.getContext("2d");
+
+    function lineAnalyse(frame) {
+      const columns = sampleColumns(frame, LINE_BAND_TOP, LINE_BAND_HEIGHT);
+
+      // A pale line on a dark floor is the same problem upside down.
+      const values = lineInvert.checked
+        ? columns.map((value) => 255 - value)
+        : columns.slice();
+
+      let darkest = Infinity;
+      let brightest = -Infinity;
+
+      for (let x = 0; x < TORCH_W; x++) {
+        if (values[x] < darkest) darkest = values[x];
+        if (values[x] > brightest) brightest = values[x];
+      }
+
+      const contrast = brightest - darkest;
+
+      if (contrast < LINE_CONTRAST) {
+        return { columns, values, found: false, contrast, centre: null };
+      }
+
+      const threshold = darkest + contrast * LINE_SHARE;
+
+      // Centre of mass of the dark part, weighted by how dark each column is,
+      // so a fat line and a thin one both report their middle.
+      let weighted = 0;
+      let weight = 0;
+
+      for (let x = 0; x < TORCH_W; x++) {
+        if (values[x] >= threshold) continue;
+
+        const w = threshold - values[x];
+        weighted += x * w;
+        weight += w;
+      }
+
+      if (weight <= 0) {
+        return { columns, values, found: false, contrast, centre: null };
+      }
+
+      return {
+        columns,
+        values,
+        found: true,
+        contrast,
+        threshold,
+        centre: weighted / weight
+      };
+    }
+
+    function lineDecide(sample) {
+      if (!sample.found) return "stop";
+
+      const middle = (TORCH_W - 1) / 2;
+      const error = sample.centre - middle;
+
+      if (error < -LINE_DEADZONE) return "left";
+      if (error > LINE_DEADZONE) return "right";
+      return "forward";
+    }
+
+    function lineDraw(sample) {
+      const width = lineCanvas.width;
+      const height = lineCanvas.height;
+      const columnWidth = width / TORCH_W;
+
+      for (let x = 0; x < TORCH_W; x++) {
+        const value =
+          Math.max(0, Math.min(255, Math.round(sample.columns[x])));
+
+        lineViewCtx.fillStyle = "rgb(" + value + "," + value + "," + value + ")";
+        lineViewCtx.fillRect(x * columnWidth, 0, columnWidth + 1, height);
+      }
+
+      if (!sample.found) return;
+
+      // Where it thinks the line is, and the middle it is steering towards.
+      lineViewCtx.fillStyle = "rgba(233, 185, 0, 0.85)";
+      lineViewCtx.fillRect(sample.centre * columnWidth - 1, 0, 3, height);
+
+      lineViewCtx.fillStyle = "rgba(255, 255, 255, 0.35)";
+      lineViewCtx.fillRect(width / 2 - 1, height - 10, 2, 10);
+    }
+
+    function lineTick() {
+      if (!lineRunning || lineBusy) return;
+      lineBusy = true;
+
+      torchGrab().then((frame) => {
+        if (!lineRunning) return;
+
+        const sample = lineAnalyse(frame);
+        const action = lineDecide(sample);
+
+        lineDraw(sample);
+        sendAction(action);
+
+        if (sample.found) {
+          const offset = sample.centre - (TORCH_W - 1) / 2;
+
+          lineReadout.textContent =
+            "line " + (offset >= 0 ? "+" : "") + offset.toFixed(1) +
+            " of centre  →  " + action;
+          lineState.textContent = "following";
+        } else {
+          lineReadout.textContent =
+            "no line (contrast " + Math.round(sample.contrast) + ")";
+          lineState.textContent = "cannot see a line";
+        }
+      }).catch(() => {
+        stopLine("could not read a frame");
+      }).then(() => {
+        lineBusy = false;
+      });
+    }
+
+    function startLine() {
+      if (lineRunning) return;
+
+      lineRunning = true;
+      lineButton.textContent = "Stop";
+      lineState.textContent = "starting";
+      lineTimer = setInterval(lineTick, LINE_TICK_MS);
+      lineTick();
+    }
+
+    function stopLine(why) {
+      if (!lineRunning) return;
+
+      lineRunning = false;
+      clearInterval(lineTimer);
+      lineTimer = null;
+
+      sendAction("stop");
+
+      lineButton.textContent = "Start";
+      lineState.textContent = why || "not running";
+    }
+
+    lineButton.addEventListener("click", () => {
+      if (lineRunning) {
+        stopLine();
+      } else {
+        stopTorch("following the line instead");
+        stopSpin("following the line instead");
+        startLine();
+      }
+    });
+
     // ---- Views ------------------------------------------------------------
     // The video stays above both views, so a program can be watched running.
 
@@ -6759,6 +6983,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       if (wanted !== "games") {
         stopTorch("left the Games tab");
         stopSpin("left the Games tab");
+        stopLine("left the Games tab");
       }
 
       prefSet("View", wanted);
