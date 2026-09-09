@@ -2697,6 +2697,19 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       background: #111;
     }
 
+    .game-overlay {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      z-index: 1;
+      pointer-events: none;
+      transform-origin: center center;
+      /* One canvas pixel is one sampled column, so keep the edges hard
+         rather than letting the browser blur them into something prettier
+         and less true. */
+      image-rendering: pixelated;
+    }
+
     .panel {
       width: min(390px, 100%);
       margin: 16px auto 0;
@@ -2865,10 +2878,39 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     /* Only ever written to when the light cannot do what the button says. */
-    .game-card {
-      margin-top: 18px;
-      padding-top: 14px;
-      border-top: 1px solid #e6e9f0;
+    .game-picker {
+      display: flex;
+      gap: 6px;
+      justify-content: center;
+      margin-bottom: 14px;
+    }
+
+    .game-pick {
+      flex: 1;
+      padding: 8px 0;
+      border: 1px solid #d7dce5;
+      border-radius: 10px;
+      background: white;
+      color: #172033;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .game-pick.is-active {
+      border-color: #2f4468;
+      background: #2f4468;
+      color: white;
+    }
+
+    .game-help {
+      margin-top: 10px;
+      text-align: left;
+    }
+
+    .game-help > summary {
+      color: #667085;
+      font-size: 12px;
+      cursor: pointer;
     }
 
     .spin-rows {
@@ -2882,23 +2924,6 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     .spin-rows div + div {
       border-top: 1px dashed #e6e9f0;
-    }
-
-    .torch-canvas {
-      display: block;
-      width: 100%;
-      height: 56px;
-      margin: 12px 0 6px;
-      border-radius: 10px;
-      background: #111;
-    }
-
-    .torch-readout {
-      margin-bottom: 12px;
-      color: #667085;
-      font-size: 12px;
-      font-variant-numeric: tabular-nums;
-      text-align: center;
     }
 
     .light-note {
@@ -3967,6 +3992,12 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     <div id="videoFrame" class="video-frame">
       <img src="" id="photo" alt="ESP32-CAM video stream">
 
+      <!-- What a game is reading, drawn over the pixels it read. It carries
+           the same transform as the image because it has to lie on top of
+           the picture, unlike the overlays below which stay upright. -->
+      <canvas id="gameOverlay" class="game-overlay"
+              width="64" height="48" aria-hidden="true" hidden></canvas>
+
       <div id="streamStatus" class="stream-status" aria-live="polite"></div>
 
       <div class="video-footer">
@@ -3981,6 +4012,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
           <span id="videoFps">-- fps</span>
           <span id="videoRssi">-- dBm</span>
           <span id="videoMotion">STOP</span>
+          <span id="videoGame" hidden></span>
         </div>
       </div>
     </div>
@@ -4084,35 +4116,45 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   </div>
 
     <div id="gamesView" class="panel" hidden>
-      <div class="program-head">
-        <strong>Follow the torch</strong>
-        <span id="torchState" class="program-count">not running</span>
+      <div class="game-picker" role="tablist" aria-label="Game">
+        <button id="gameTorchTab" class="game-pick is-active" type="button"
+                role="tab" aria-selected="true">Torch</button>
+        <button id="gameSpinTab" class="game-pick" type="button"
+                role="tab" aria-selected="false">Turn</button>
+        <button id="gameLineTab" class="game-pick" type="button"
+                role="tab" aria-selected="false">Line</button>
       </div>
 
-      <div class="note">
-        This robot has no light sensor, so the camera is the sensor. Four times
-        a second it takes a picture, reads one strip across the middle, and
-        turns towards whichever side is brighter. Dim the room, shine a phone
-        torch at it, and walk backwards.
+      <div id="gameTorch" class="game-card">
+        <div class="program-head">
+          <strong>Follow the torch</strong>
+          <span id="torchState" class="program-count">not running</span>
+        </div>
+
+        <div class="note">
+          This robot has no light sensor, so the camera is the sensor. Four
+          times a second it reads one strip across the middle of the picture
+          and turns towards whichever side is brighter. Dim the room, shine a
+          phone torch at it, and walk backwards.
+        </div>
+
+        <div class="program-buttons">
+          <button id="torchButton" class="slot-button" type="button">Start</button>
+        </div>
+
+        <details class="game-help">
+          <summary>If it misbehaves</summary>
+          <div class="note">
+            While it runs, the strip it is reading is drawn on the video,
+            brightest as white, with the half it chose shaded. If it drives
+            away from the torch instead of towards it the picture is
+            mirrored: turn off Mirror in Settings, or tick a wheel under
+            Wheel direction.
+          </div>
+        </details>
       </div>
 
-      <canvas id="torchCanvas" class="torch-canvas" width="256" height="56"
-              aria-label="The strip the robot is looking at"></canvas>
-
-      <div id="torchReadout" class="torch-readout">left --  |  right --</div>
-
-      <div class="program-buttons">
-        <button id="torchButton" class="slot-button" type="button">Start</button>
-      </div>
-
-      <div class="note">
-        The strip above is exactly what it is deciding from, brightest as
-        white. The shaded half is the way it chose to turn. If it drives away
-        from the torch instead of towards it, the picture is mirrored: turn
-        off Mirror in Settings, or tick a wheel under Wheel direction.
-      </div>
-
-      <div class="game-card">
+      <div id="gameSpin" class="game-card" hidden>
         <div class="program-head">
           <strong>How fast does it turn?</strong>
           <span id="spinState" class="program-count">not measured</span>
@@ -4131,17 +4173,20 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
         <div id="spinRows" class="spin-rows"></div>
 
-        <div class="note">
-          Degrees per second, worked out from how far the picture moved and
-          how wide a view the camera has, so read it as close rather than
-          exact. Turning left is the right wheel doing the work and turning
-          right is the left one, so a slow wheel shows up on the opposite
-          line. Below a wheel's wake-up number the picture does not move at
-          all, and the answer is zero.
-        </div>
+        <details class="game-help">
+          <summary>What the numbers mean</summary>
+          <div class="note">
+            Degrees per second, worked out from how far the picture moved and
+            how wide a view the camera has, so read it as close rather than
+            exact. Turning left is the right wheel doing the work and turning
+            right is the left one, so a slow wheel shows up on the opposite
+            line. Below a wheel's wake-up number the picture does not move at
+            all, and the answer is zero.
+          </div>
+        </details>
       </div>
 
-      <div class="game-card">
+      <div id="gameLine" class="game-card" hidden>
         <div class="program-head">
           <strong>Follow the line</strong>
           <span id="lineState" class="program-count">not running</span>
@@ -4150,14 +4195,8 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         <div class="note">
           Lay a line of dark tape across a pale floor. The robot reads a strip
           along the bottom of the picture -- the floor just in front of its
-          wheels -- finds the darkest part of it, and steers to keep that in
-          the middle.
+          wheels -- finds the darkest part, and steers to keep it centred.
         </div>
-
-        <canvas id="lineCanvas" class="torch-canvas" width="256" height="56"
-                aria-label="The floor strip the robot is following"></canvas>
-
-        <div id="lineReadout" class="torch-readout">no line yet</div>
 
         <div class="program-buttons">
           <button id="lineButton" class="slot-button" type="button">Start</button>
@@ -4168,13 +4207,17 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
           Pale line on a dark floor
         </label>
 
-        <div class="note">
-          The mark shows where it thinks the line is. When it cannot tell the
-          line from the floor it stops rather than guessing, and more light or
-          more contrast between tape and floor will fix that faster than
-          anything on this page. Turn the Speed down first: fast is how a line
-          follower loses the corner.
-        </div>
+        <details class="game-help">
+          <summary>If it cannot see the line</summary>
+          <div class="note">
+            The strip and the mark it puts on the line are drawn on the video
+            while it runs. It stops rather than guessing, and says why: too
+            dark, nothing that looks like tape, a dark patch too wide to be a
+            line, or more than one patch and no way to tell which is meant. More light or more contrast between tape and floor fixes
+            all three faster than anything on this page. Turn the Speed down
+            first: fast is how a line follower loses the corner.
+          </div>
+        </details>
       </div>
     </div>
 
@@ -4221,6 +4264,8 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   <script>
     const photo = document.getElementById("photo");
     const videoFrame = document.getElementById("videoFrame");
+    const gameOverlay = document.getElementById("gameOverlay");
+    const videoGame = document.getElementById("videoGame");
     const leftSpeedSlider = document.getElementById("leftSpeedSlider");
     const rightSpeedSlider = document.getElementById("rightSpeedSlider");
     const leftSpeedValue = document.getElementById("leftSpeedValue");
@@ -4416,6 +4461,14 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
           "translate(-50%, -50%) rotate(" +
           cameraRotationDegrees +
           "deg)";
+
+        // The band a game samples is a crop of the sensor image, so its
+        // overlay only lines up if it is rotated and sized exactly as the
+        // picture is. Mirroring needs nothing here: hmirror happens in the
+        // sensor, so /capture and the stream are already mirrored alike.
+        gameOverlay.style.width = photo.style.width;
+        gameOverlay.style.height = photo.style.height;
+        gameOverlay.style.transform = photo.style.transform;
       });
     }
 
@@ -6046,26 +6099,20 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // everything that ends a drive ends a replay too.
     window.addEventListener("blur", () => {
       stopPlayback();
-      stopTorch("window lost focus");
-      stopSpin("window lost focus");
-      stopLine("window lost focus");
+      stopAllGames("window lost focus");
       endDrive();
     });
 
     window.addEventListener("pagehide", () => {
       stopPlayback();
-      stopTorch("page closed");
-      stopSpin("page closed");
-      stopLine("page closed");
+      stopAllGames("page closed");
       endDrive();
     });
 
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
         stopPlayback();
-        stopTorch("tab hidden");
-        stopSpin("tab hidden");
-        stopLine("tab hidden");
+        stopAllGames("tab hidden");
         endDrive();
       }
     });
@@ -6447,8 +6494,6 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // does and is governed by the same motion timeout. It cannot ask for
     // anything a finger could not.
 
-    const torchCanvas = document.getElementById("torchCanvas");
-    const torchReadout = document.getElementById("torchReadout");
     const torchButton = document.getElementById("torchButton");
     const torchState = document.getElementById("torchState");
 
@@ -6468,7 +6513,43 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     const torchWorkCtx =
       torchWork.getContext("2d", { willReadFrequently: true });
-    const torchViewCtx = torchCanvas.getContext("2d");
+
+    // The overlay is one canvas pixel per sampled column, laid over the
+    // picture it was read from, so a band drawn at the rows it sampled sits
+    // exactly on those pixels.
+    const overlayCtx = gameOverlay.getContext("2d");
+
+    function overlayShow(on) {
+      gameOverlay.hidden = !on;
+      videoGame.hidden = !on;
+
+      if (!on) {
+        overlayCtx.clearRect(0, 0, TORCH_W, TORCH_H);
+        videoGame.textContent = "";
+      }
+    }
+
+    // Paints one sampled band where it was taken from. Returns the row range
+    // so a caller can mark something inside it.
+    function overlayBand(columns, topFraction, heightFraction) {
+      const top = Math.round(TORCH_H * topFraction);
+      const rows = Math.max(1, Math.round(TORCH_H * heightFraction));
+
+      overlayCtx.clearRect(0, 0, TORCH_W, TORCH_H);
+      overlayCtx.globalAlpha = 0.85;
+
+      for (let x = 0; x < TORCH_W; x++) {
+        const value = Math.max(0, Math.min(255, Math.round(columns[x])));
+
+        overlayCtx.fillStyle =
+          "rgb(" + value + "," + value + "," + value + ")";
+        overlayCtx.fillRect(x, top, 1, rows);
+      }
+
+      overlayCtx.globalAlpha = 1;
+
+      return { top, rows };
+    }
 
     function torchGrab() {
       return new Promise((resolve, reject) => {
@@ -6537,23 +6618,15 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       return "forward";
     }
 
-    // The whole point of the game: the child watches the robot think.
+    // The whole point of the game: the child watches the robot think, on the
+    // picture rather than in a box somewhere below it.
     function torchDraw(sample, action) {
-      const width = torchCanvas.width;
-      const height = torchCanvas.height;
-      const columnWidth = width / TORCH_W;
-
-      for (let x = 0; x < TORCH_W; x++) {
-        const value = Math.max(0, Math.min(255, Math.round(sample.columns[x])));
-        torchViewCtx.fillStyle =
-          "rgb(" + value + "," + value + "," + value + ")";
-        torchViewCtx.fillRect(x * columnWidth, 0, columnWidth + 1, height);
-      }
+      const band = overlayBand(sample.columns, 0.38, 0.34);
 
       if (action === "left" || action === "right") {
-        torchViewCtx.fillStyle = "rgba(233, 185, 0, 0.32)";
-        torchViewCtx.fillRect(
-          action === "left" ? 0 : width / 2, 0, width / 2, height
+        overlayCtx.fillStyle = "rgba(233, 185, 0, 0.32)";
+        overlayCtx.fillRect(
+          action === "left" ? 0 : TORCH_W / 2, band.top, TORCH_W / 2, band.rows
         );
       }
     }
@@ -6572,10 +6645,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         torchDraw(sample, action);
         sendAction(action);
 
-        torchReadout.textContent =
-          "left " + Math.round(sample.left) +
-          "  |  right " + Math.round(sample.right) +
-          "  →  " + action;
+        videoGame.textContent =
+          "L " + Math.round(sample.left) +
+          " / R " + Math.round(sample.right) +
+          " → " + action;
 
         torchState.textContent =
           action === "stop" ? "looking for a light" : "chasing";
@@ -6590,6 +6663,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       if (torchRunning) return;
 
       torchRunning = true;
+      overlayShow(true);
       torchButton.textContent = "Stop";
       torchState.textContent = "starting";
       torchTimer = setInterval(torchTick, TORCH_TICK_MS);
@@ -6602,6 +6676,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       torchRunning = false;
       clearInterval(torchTimer);
       torchTimer = null;
+      overlayShow(false);
 
       // Always leave the robot stopped, however the game ended.
       sendAction("stop");
@@ -6787,8 +6862,6 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     // room as well as on white paper under a lamp. When the two are too close
     // together to tell apart it stops instead of inventing a line.
 
-    const lineCanvas = document.getElementById("lineCanvas");
-    const lineReadout = document.getElementById("lineReadout");
     const lineButton = document.getElementById("lineButton");
     const lineState = document.getElementById("lineState");
     const lineInvert = document.getElementById("lineInvert");
@@ -6799,12 +6872,13 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     const LINE_CONTRAST = 22;   // darkest to brightest, below this there is no line
     const LINE_SHARE = 0.4;     // how far down that range still counts as line
     const LINE_DEADZONE = 5;    // columns either side of centre that count as straight
+    const LINE_LIT = 60;        // the pale end must be at least this bright
+    const LINE_MAX_WIDTH = 0.4; // wider than this is a shadow, not tape
+    const LINE_EDGE = 3;        // columns ignored each side, where the lens darkens
 
     let lineRunning = false;
     let lineTimer = null;
     let lineBusy = false;
-
-    const lineViewCtx = lineCanvas.getContext("2d");
 
     function lineAnalyse(frame) {
       const columns = sampleColumns(frame, LINE_BAND_TOP, LINE_BAND_HEIGHT);
@@ -6814,46 +6888,76 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         ? columns.map((value) => 255 - value)
         : columns.slice();
 
+      // The lens darkens towards the edges, and in a dim room that vignette
+      // is the darkest thing in the strip. Ignoring the outermost columns
+      // stops the robot chasing its own optics.
       let darkest = Infinity;
       let brightest = -Infinity;
 
-      for (let x = 0; x < TORCH_W; x++) {
+      for (let x = LINE_EDGE; x < TORCH_W - LINE_EDGE; x++) {
         if (values[x] < darkest) darkest = values[x];
         if (values[x] > brightest) brightest = values[x];
       }
 
       const contrast = brightest - darkest;
+      const miss = (why) => ({ columns, values, found: false, contrast, why });
 
-      if (contrast < LINE_CONTRAST) {
-        return { columns, values, found: false, contrast, centre: null };
-      }
+      // A pale end that is itself dark means the floor is not lit at all.
+      // Saying so is more use than steering by whatever noise is brightest.
+      if (brightest < LINE_LIT) return miss("too dark to see the floor");
+      if (contrast < LINE_CONTRAST) return miss("no tape in sight");
 
       const threshold = darkest + contrast * LINE_SHARE;
 
-      // Centre of mass of the dark part, weighted by how dark each column is,
-      // so a fat line and a thin one both report their middle.
-      let weighted = 0;
-      let weight = 0;
+      // Tape is one connected run of dark columns. Collecting runs rather
+      // than one centre of mass over everything dark is what stops the robot
+      // steering at the average of two things: a vignette darkens both edges
+      // and averages to dead centre, which is a confident wrong answer.
+      const runs = [];
+      let run = null;
 
-      for (let x = 0; x < TORCH_W; x++) {
-        if (values[x] >= threshold) continue;
+      for (let x = LINE_EDGE; x < TORCH_W - LINE_EDGE; x++) {
+        if (values[x] >= threshold) {
+          run = null;
+          continue;
+        }
+
+        if (!run) {
+          run = { from: x, to: x, weighted: 0, weight: 0 };
+          runs.push(run);
+        }
 
         const w = threshold - values[x];
-        weighted += x * w;
-        weight += w;
+
+        run.to = x;
+        run.weighted += x * w;
+        run.weight += w;
       }
 
-      if (weight <= 0) {
-        return { columns, values, found: false, contrast, centre: null };
+      // A single column is noise rather than tape.
+      const candidates = runs.filter((one) => one.to > one.from);
+
+      if (candidates.length === 0) return miss("no tape in sight");
+      if (candidates.length > 1) return miss("more than one dark patch");
+
+      const line = candidates[0];
+
+      // Tape covers a slice of the floor. A dark half of the picture is a
+      // shadow, a wall, or an unlit room -- and following it drives at
+      // whatever cast it.
+      if (line.to - line.from + 1 > TORCH_W * LINE_MAX_WIDTH) {
+        return miss("dark patch too wide to be a line");
       }
 
+      // Weighted by how dark each column is, so fat tape and thin tape both
+      // report their middle.
       return {
         columns,
         values,
         found: true,
         contrast,
         threshold,
-        centre: weighted / weight
+        centre: line.weighted / line.weight
       };
     }
 
@@ -6869,26 +6973,18 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     function lineDraw(sample) {
-      const width = lineCanvas.width;
-      const height = lineCanvas.height;
-      const columnWidth = width / TORCH_W;
+      const band = overlayBand(sample.columns, LINE_BAND_TOP, LINE_BAND_HEIGHT);
 
-      for (let x = 0; x < TORCH_W; x++) {
-        const value =
-          Math.max(0, Math.min(255, Math.round(sample.columns[x])));
-
-        lineViewCtx.fillStyle = "rgb(" + value + "," + value + "," + value + ")";
-        lineViewCtx.fillRect(x * columnWidth, 0, columnWidth + 1, height);
-      }
+      // The middle it is steering towards, always shown, so an off-centre
+      // line is visibly off-centre.
+      overlayCtx.fillStyle = "rgba(255, 255, 255, 0.45)";
+      overlayCtx.fillRect(TORCH_W / 2, band.top + band.rows - 3, 1, 3);
 
       if (!sample.found) return;
 
-      // Where it thinks the line is, and the middle it is steering towards.
-      lineViewCtx.fillStyle = "rgba(233, 185, 0, 0.85)";
-      lineViewCtx.fillRect(sample.centre * columnWidth - 1, 0, 3, height);
-
-      lineViewCtx.fillStyle = "rgba(255, 255, 255, 0.35)";
-      lineViewCtx.fillRect(width / 2 - 1, height - 10, 2, 10);
+      // Where it thinks the line is.
+      overlayCtx.fillStyle = "rgba(233, 185, 0, 0.9)";
+      overlayCtx.fillRect(Math.round(sample.centre), band.top, 1, band.rows);
     }
 
     function lineTick() {
@@ -6907,14 +7003,13 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         if (sample.found) {
           const offset = sample.centre - (TORCH_W - 1) / 2;
 
-          lineReadout.textContent =
+          videoGame.textContent =
             "line " + (offset >= 0 ? "+" : "") + offset.toFixed(1) +
-            " of centre  →  " + action;
+            " → " + action;
           lineState.textContent = "following";
         } else {
-          lineReadout.textContent =
-            "no line (contrast " + Math.round(sample.contrast) + ")";
-          lineState.textContent = "cannot see a line";
+          videoGame.textContent = sample.why;
+          lineState.textContent = sample.why;
         }
       }).catch(() => {
         stopLine("could not read a frame");
@@ -6927,6 +7022,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       if (lineRunning) return;
 
       lineRunning = true;
+      overlayShow(true);
       lineButton.textContent = "Stop";
       lineState.textContent = "starting";
       lineTimer = setInterval(lineTick, LINE_TICK_MS);
@@ -6939,6 +7035,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       lineRunning = false;
       clearInterval(lineTimer);
       lineTimer = null;
+      overlayShow(false);
 
       sendAction("stop");
 
@@ -6955,6 +7052,44 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         startLine();
       }
     });
+
+    // ---- Games: which one is showing --------------------------------------
+    // Only one game may drive the robot, so only one is on screen. Switching
+    // stops whatever was running rather than leaving it driving from a panel
+    // nobody can see.
+
+    const gamePanels = [
+      ["torch", document.getElementById("gameTorchTab"), document.getElementById("gameTorch")],
+      ["spin", document.getElementById("gameSpinTab"), document.getElementById("gameSpin")],
+      ["line", document.getElementById("gameLineTab"), document.getElementById("gameLine")]
+    ];
+
+    function stopAllGames(why) {
+      stopTorch(why);
+      stopSpin(why);
+      stopLine(why);
+    }
+
+    function showGame(name) {
+      stopAllGames("switched game");
+
+      gamePanels.forEach(([id, tab, panel]) => {
+        const chosen = id === name;
+
+        panel.hidden = !chosen;
+        tab.classList.toggle("is-active", chosen);
+        tab.setAttribute("aria-selected", String(chosen));
+      });
+
+      prefSet("Game", name);
+    }
+
+    gamePanels.forEach(([id, tab]) => {
+      tab.addEventListener("click", () => showGame(id));
+    });
+
+    showGame(prefGet("Game", "torch"));
+
 
     // ---- Views ------------------------------------------------------------
     // The video stays above both views, so a program can be watched running.
@@ -6980,11 +7115,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
       // Leaving the tab is a release like any other: a game that drives the
       // robot must not keep driving it from a view nobody is looking at.
-      if (wanted !== "games") {
-        stopTorch("left the Games tab");
-        stopSpin("left the Games tab");
-        stopLine("left the Games tab");
-      }
+      if (wanted !== "games") stopAllGames("left the Games tab");
 
       prefSet("View", wanted);
     }
