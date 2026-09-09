@@ -2865,6 +2865,25 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     /* Only ever written to when the light cannot do what the button says. */
+    .game-card {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid #e6e9f0;
+    }
+
+    .spin-rows {
+      margin: 10px 0 0;
+      color: #172033;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.6;
+      text-align: left;
+    }
+
+    .spin-rows div + div {
+      border-top: 1px dashed #e6e9f0;
+    }
+
     .torch-canvas {
       display: block;
       width: 100%;
@@ -4091,6 +4110,35 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         white. The shaded half is the way it chose to turn. If it drives away
         from the torch instead of towards it, the picture is mirrored: turn
         off Mirror in Settings, or tick a wheel under Wheel direction.
+      </div>
+
+      <div class="game-card">
+        <div class="program-head">
+          <strong>How fast does it turn?</strong>
+          <span id="spinState" class="program-count">not measured</span>
+        </div>
+
+        <div class="note">
+          Give it room. The robot spins itself one way for two seconds, then
+          the other, and watches how fast the picture slides past. The two
+          numbers should match. They will not, because the two motors are not
+          identical -- and that is the whole point.
+        </div>
+
+        <div class="program-buttons">
+          <button id="spinButton" class="slot-button" type="button">Measure</button>
+        </div>
+
+        <div id="spinRows" class="spin-rows"></div>
+
+        <div class="note">
+          Degrees per second, worked out from how far the picture moved and
+          how wide a view the camera has, so read it as close rather than
+          exact. Turning left is the right wheel doing the work and turning
+          right is the left one, so a slow wheel shows up on the opposite
+          line. Below a wheel's wake-up number the picture does not move at
+          all, and the answer is zero.
+        </div>
       </div>
     </div>
 
@@ -5963,12 +6011,14 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     window.addEventListener("blur", () => {
       stopPlayback();
       stopTorch("window lost focus");
+      stopSpin("window lost focus");
       endDrive();
     });
 
     window.addEventListener("pagehide", () => {
       stopPlayback();
       stopTorch("page closed");
+      stopSpin("page closed");
       endDrive();
     });
 
@@ -5976,6 +6026,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       if (document.hidden) {
         stopPlayback();
         stopTorch("tab hidden");
+        stopSpin("tab hidden");
         endDrive();
       }
     });
@@ -6390,11 +6441,13 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       });
     }
 
-    function torchAnalyse(frame) {
+    // Average brightness of each column of a band across the middle of the
+    // frame. Both games read the same band: the floor right in front is
+    // mostly the robot's own shadow, and the ceiling is where the room
+    // lights are.
+    function sampleColumns(frame) {
       torchWorkCtx.drawImage(frame, 0, 0, TORCH_W, TORCH_H);
 
-      // A band across the middle: the floor immediately ahead is mostly the
-      // robot's own shadow, and the ceiling is where the room lights are.
       const top = Math.round(TORCH_H * 0.38);
       const rows = Math.max(1, Math.round(TORCH_H * 0.34));
       const band = torchWorkCtx.getImageData(0, top, TORCH_W, rows);
@@ -6413,12 +6466,19 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         }
       }
 
+      for (let x = 0; x < TORCH_W; x++) columns[x] /= rows;
+
+      return columns;
+    }
+
+    function torchAnalyse(frame) {
+      const columns = sampleColumns(frame);
+
       let left = 0;
       let right = 0;
       const half = TORCH_W >> 1;
 
       for (let x = 0; x < TORCH_W; x++) {
-        columns[x] /= rows;
         if (x < half) left += columns[x]; else right += columns[x];
       }
 
@@ -6509,7 +6569,167 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
 
     torchButton.addEventListener("click", () => {
-      if (torchRunning) stopTorch(); else startTorch();
+      if (torchRunning) {
+        stopTorch();
+      } else {
+        stopSpin("stopped");
+        startTorch();
+      }
+    });
+
+
+    // ---- Games: how fast does it turn? -------------------------------------
+    // Driving forward makes the picture expand from the centre rather than
+    // slide, and how fast it expands depends on how far away the furniture
+    // is -- so forward speed is not honestly measurable this way. Turning
+    // does slide the whole scene sideways at a rate that depends only on how
+    // fast the robot is turning, so that is what this measures.
+    //
+    // The robot spins itself, which is why each leg is capped: a lost frame
+    // must not be able to leave a wheel running.
+
+    const spinButton = document.getElementById("spinButton");
+    const spinState = document.getElementById("spinState");
+    const spinRows = document.getElementById("spinRows");
+
+    const SPIN_TICK_MS = 250;
+    const SPIN_LEG_MS = 2000;
+    const SPIN_SETTLE_MS = 600;
+    const SPIN_MAX_SHIFT = 8;
+
+    // Nominal horizontal field of view of the OV2640 lens these boards ship
+    // with. It is a catalogue figure, not a measured one, which is why the
+    // panel calls the answer close rather than exact.
+    const CAMERA_FOV_DEGREES = 65;
+    const DEGREES_PER_COLUMN = CAMERA_FOV_DEGREES / TORCH_W;
+
+    let spinRunning = false;
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // How far the scene slid between two frames, in columns. Scores every
+    // shift by mean absolute difference over the part that overlaps and
+    // keeps the best -- the overlap shrinks as the shift grows, so the mean
+    // rather than the sum is what makes the scores comparable.
+    function spinShift(previous, current) {
+      let bestShift = 0;
+      let bestScore = Infinity;
+
+      for (let shift = -SPIN_MAX_SHIFT; shift <= SPIN_MAX_SHIFT; shift++) {
+        let total = 0;
+        let counted = 0;
+
+        for (let x = 0; x < TORCH_W; x++) {
+          const from = x - shift;
+          if (from < 0 || from >= TORCH_W) continue;
+
+          total += Math.abs(current[x] - previous[from]);
+          counted++;
+        }
+
+        if (counted < TORCH_W / 2) continue;
+
+        const score = total / counted;
+
+        if (score < bestScore) {
+          bestScore = score;
+          bestShift = shift;
+        }
+      }
+
+      return bestShift;
+    }
+
+    async function spinLeg(action) {
+      const started = Date.now();
+      let previous = null;
+      let columnsSwept = 0;
+
+      while (spinRunning && Date.now() - started < SPIN_LEG_MS) {
+        const tickStarted = Date.now();
+
+        sendAction(action);
+
+        let frame;
+        try {
+          frame = await torchGrab();
+        } catch (error) {
+          break;
+        }
+
+        if (!spinRunning) break;
+
+        const columns = sampleColumns(frame);
+        if (previous) columnsSwept += Math.abs(spinShift(previous, columns));
+        previous = columns;
+
+        const remaining = SPIN_TICK_MS - (Date.now() - tickStarted);
+        if (remaining > 0) await sleep(remaining);
+      }
+
+      const seconds = (Date.now() - started) / 1000;
+      return seconds > 0 ? (columnsSwept * DEGREES_PER_COLUMN) / seconds : 0;
+    }
+
+    function spinAddRow(requested, left, right) {
+      const row = document.createElement("div");
+      const difference = Math.abs(left - right);
+
+      row.textContent =
+        "asked " + requested +
+        "  →  left " + left.toFixed(0) + "°/s" +
+        ", right " + right.toFixed(0) + "°/s" +
+        "  (" + difference.toFixed(0) + " apart)";
+
+      spinRows.prepend(row);
+    }
+
+    async function runSpin() {
+      // The two games drive the same robot; only one may have it.
+      stopTorch("measuring instead");
+
+      spinRunning = true;
+      spinButton.textContent = "Stop";
+
+      const requested = driveSpeedSlider.value;
+
+      try {
+        spinState.textContent = "turning left";
+        const left = await spinLeg("left");
+
+        sendAction("stop");
+        await sleep(SPIN_SETTLE_MS);
+
+        if (!spinRunning) return;
+
+        spinState.textContent = "turning right";
+        const right = await spinLeg("right");
+
+        sendAction("stop");
+
+        if (!spinRunning) return;
+
+        spinAddRow(requested, left, right);
+        spinState.textContent = "measured";
+      } finally {
+        stopSpin();
+      }
+    }
+
+    function stopSpin(why) {
+      if (!spinRunning) return;
+
+      spinRunning = false;
+      sendAction("stop");
+      spinButton.textContent = "Measure";
+
+      if (why) spinState.textContent = why;
+    }
+
+    spinButton.addEventListener("click", () => {
+      if (spinRunning) stopSpin("stopped"); else runSpin();
     });
 
     // ---- Views ------------------------------------------------------------
@@ -6536,7 +6756,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
       // Leaving the tab is a release like any other: a game that drives the
       // robot must not keep driving it from a view nobody is looking at.
-      if (wanted !== "games") stopTorch("left the Games tab");
+      if (wanted !== "games") {
+        stopTorch("left the Games tab");
+        stopSpin("left the Games tab");
+      }
 
       prefSet("View", wanted);
     }
