@@ -1994,6 +1994,20 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       box-shadow: 0 10px 26px rgba(0, 0, 0, 0.22);
     }
 
+    /* One quiet line above everything else. The page is served from the robot
+       with no internet, so the stack is local Naskh faces only -- whichever
+       the device happens to have -- ending at the generic serif. */
+    .basmala {
+      margin: 0 0 2px;
+      font-family: "Amiri", "Scheherazade New", "Traditional Arabic",
+                   "Noto Naskh Arabic", "Geeza Pro", serif;
+      font-size: 11px;
+      line-height: 1.25;
+      text-align: center;
+      color: #cbbd9c;
+      opacity: 0.45;
+    }
+
     .hero-inner {
       display: flex;
       align-items: center;
@@ -3411,6 +3425,8 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   </svg>
 
   <header class="hero">
+    <div class="basmala" lang="ar" dir="rtl">بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ</div>
+
     <div class="hero-inner">
       <div class="hero-left">
         <svg class="hero-logo" aria-hidden="true" focusable="false"><use href="#wdiLogo"></use></svg>
