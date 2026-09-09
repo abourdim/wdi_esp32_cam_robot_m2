@@ -2902,6 +2902,22 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       color: white;
     }
 
+    .game-cover-hint {
+      margin: -6px 0 14px;
+      color: #667085;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .card-swatch {
+      display: inline-block;
+      width: 26px;
+      height: 26px;
+      border: 1px solid #d7dce5;
+      border-radius: 8px;
+      vertical-align: middle;
+    }
+
     .game-help {
       margin-top: 10px;
       text-align: left;
@@ -4123,6 +4139,13 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
                 role="tab" aria-selected="false">Turn</button>
         <button id="gameLineTab" class="game-pick" type="button"
                 role="tab" aria-selected="false">Line</button>
+        <button id="gameCardTab" class="game-pick" type="button"
+                role="tab" aria-selected="false">Card</button>
+      </div>
+
+      <div class="game-cover-hint">
+        Whichever game is running, put your hand over the camera and the robot
+        stops.
       </div>
 
       <div id="gameTorch" class="game-card">
@@ -4213,9 +4236,43 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
             The strip and the mark it puts on the line are drawn on the video
             while it runs. It stops rather than guessing, and says why: too
             dark, nothing that looks like tape, a dark patch too wide to be a
-            line, or more than one patch and no way to tell which is meant. More light or more contrast between tape and floor fixes
-            all three faster than anything on this page. Turn the Speed down
-            first: fast is how a line follower loses the corner.
+            line, or more than one patch and no way to tell which is meant.
+            More light or more contrast between tape and floor fixes all of
+            them faster than anything on this page. Turn the Speed down first:
+            fast is how a line follower loses the corner.
+          </div>
+        </details>
+      </div>
+
+      <div id="gameCard" class="game-card" hidden>
+        <div class="program-head">
+          <strong>Follow the card</strong>
+          <span id="cardState" class="program-count">no card learned</span>
+        </div>
+
+        <div class="note">
+          Show the robot a brightly coloured card, then hold it up to one side
+          and it turns that way. It is following the colour and not your hand,
+          which you can prove to it by hiding the card and waving.
+        </div>
+
+        <div class="program-buttons">
+          <button id="cardLearn" class="slot-button" type="button">Show it the card</button>
+          <button id="cardButton" class="slot-button" type="button" disabled>Start</button>
+          <span id="cardSwatch" class="card-swatch" hidden></span>
+        </div>
+
+        <details class="game-help">
+          <summary>If it loses the card</summary>
+          <div class="note">
+            Hold the card in the middle of the picture and press Show it the
+            card again. Learning it afresh is normal: the camera adjusts its
+            own colours as the room changes and the card drifts with them. A
+            white or grey card cannot be learned at all, because there is no
+            colour in it to tell from the floor. Hold the card still to one
+            side and wait for the robot to come round rather than steering
+            with it: at four decisions a second it answers a moment after you
+            move.
           </div>
         </details>
       </div>
@@ -6594,6 +6651,102 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       return columns;
     }
 
+    // The same band, kept as colour. Only the card game needs this, and it
+    // costs a second read of the pixels, so the other games stay on the
+    // cheaper luma path above.
+    function sampleColour(frame, topFraction, heightFraction) {
+      torchWorkCtx.drawImage(frame, 0, 0, TORCH_W, TORCH_H);
+
+      const top = Math.round(TORCH_H * topFraction);
+      const rows = Math.max(1, Math.round(TORCH_H * heightFraction));
+      const band = torchWorkCtx.getImageData(0, top, TORCH_W, rows);
+
+      const red = new Array(TORCH_W).fill(0);
+      const green = new Array(TORCH_W).fill(0);
+      const blue = new Array(TORCH_W).fill(0);
+
+      for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < TORCH_W; x++) {
+          const i = (y * TORCH_W + x) * 4;
+
+          red[x] += band.data[i];
+          green[x] += band.data[i + 1];
+          blue[x] += band.data[i + 2];
+        }
+      }
+
+      const luma = new Array(TORCH_W).fill(0);
+
+      for (let x = 0; x < TORCH_W; x++) {
+        red[x] /= rows;
+        green[x] /= rows;
+        blue[x] /= rows;
+        luma[x] = 0.299 * red[x] + 0.587 * green[x] + 0.114 * blue[x];
+      }
+
+      return { red, green, blue, luma };
+    }
+
+    // ---- Games: a hand over the lens stops the robot ------------------------
+    // A covered lens and an unlit room look alike if you only measure how dark
+    // the picture is, so this asks for all three: dark, flat -- a covering
+    // leaves no highlight anywhere in the frame -- and a change, because
+    // starting in the dark is not somebody covering anything. Two frames must
+    // agree, so a single bad grab cannot stop a robot mid-game.
+
+    const COVER_DARK = 35;
+    const COVER_FLAT = 22;
+    const COVER_WAS_LIT = 60;
+    const COVER_FRAMES = 2;
+
+    let coverStreak = 0;
+    let coverWasLit = false;
+
+    function resetCoverWatch() {
+      coverStreak = 0;
+      coverWasLit = false;
+    }
+
+    function frameIsCovered(frame) {
+      // The whole frame, not the band a game happens to be reading. A hand
+      // covers everything; a dim room nearly always has something brighter
+      // somewhere -- a window, a lamp, the ceiling -- and judging only the
+      // band would call that room a covering.
+      torchWorkCtx.drawImage(frame, 0, 0, TORCH_W, TORCH_H);
+
+      const all = torchWorkCtx.getImageData(0, 0, TORCH_W, TORCH_H).data;
+      const pixels = TORCH_W * TORCH_H;
+
+      let total = 0;
+      let darkest = Infinity;
+      let brightest = -Infinity;
+
+      for (let i = 0; i < pixels; i++) {
+        const at = i * 4;
+        const value =
+          0.299 * all[at] + 0.587 * all[at + 1] + 0.114 * all[at + 2];
+
+        total += value;
+        if (value < darkest) darkest = value;
+        if (value > brightest) brightest = value;
+      }
+
+      const mean = total / pixels;
+
+      if (mean > COVER_WAS_LIT) coverWasLit = true;
+
+      const covered =
+        coverWasLit && mean < COVER_DARK && brightest - darkest < COVER_FLAT;
+
+      coverStreak = covered ? coverStreak + 1 : 0;
+
+      if (coverStreak < COVER_FRAMES) return false;
+
+      // The lens has to see daylight again before this can fire twice.
+      resetCoverWatch();
+      return true;
+    }
+
     function torchAnalyse(frame) {
       const columns = sampleColumns(frame);
 
@@ -6640,6 +6793,12 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         if (!torchRunning) return;
 
         const sample = torchAnalyse(frame);
+
+        if (frameIsCovered(frame)) {
+          stopTorch("hand over the camera");
+          return;
+        }
+
         const action = torchDecide(sample);
 
         torchDraw(sample, action);
@@ -6664,6 +6823,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
       torchRunning = true;
       overlayShow(true);
+      resetCoverWatch();
       torchButton.textContent = "Stop";
       torchState.textContent = "starting";
       torchTimer = setInterval(torchTick, TORCH_TICK_MS);
@@ -6691,6 +6851,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       } else {
         stopSpin("stopped");
         stopLine("chasing the torch instead");
+        stopCard("chasing the torch instead");
         startTorch();
       }
     });
@@ -6780,6 +6941,12 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         if (!spinRunning) break;
 
         const columns = sampleColumns(frame);
+
+        if (frameIsCovered(frame)) {
+          stopSpin("hand over the camera");
+          break;
+        }
+
         if (previous) columnsSwept += Math.abs(spinShift(previous, columns));
         previous = columns;
 
@@ -6808,8 +6975,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       // The games drive the same robot; only one may have it.
       stopTorch("measuring instead");
       stopLine("measuring instead");
+      stopCard("measuring instead");
 
       spinRunning = true;
+      resetCoverWatch();
       spinButton.textContent = "Stop";
 
       const requested = driveSpeedSlider.value;
@@ -6995,6 +7164,12 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         if (!lineRunning) return;
 
         const sample = lineAnalyse(frame);
+
+        if (frameIsCovered(frame)) {
+          stopLine("hand over the camera");
+          return;
+        }
+
         const action = lineDecide(sample);
 
         lineDraw(sample);
@@ -7023,6 +7198,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
       lineRunning = true;
       overlayShow(true);
+      resetCoverWatch();
       lineButton.textContent = "Stop";
       lineState.textContent = "starting";
       lineTimer = setInterval(lineTick, LINE_TICK_MS);
@@ -7049,7 +7225,281 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       } else {
         stopTorch("following the line instead");
         stopSpin("following the line instead");
+        stopCard("following the line instead");
         startLine();
+      }
+    });
+
+
+    // ---- Games: follow the card ---------------------------------------------
+    // A card rather than a hand, deliberately. Recognising a hand needs a model
+    // this page cannot load, and the shortcut people reach for instead -- test
+    // the pixels for skin colour -- works for some children and not others,
+    // which is worse than not having the game at all. A card works for
+    // everyone, and a child can see what the robot is actually following.
+    //
+    // Colours are compared as chromaticity, each channel over the sum of the
+    // three, so the match survives the card moving into shade. Raw RGB would
+    // lose it the moment a shadow crossed it.
+
+    const cardLearn = document.getElementById("cardLearn");
+    const cardButton = document.getElementById("cardButton");
+    const cardState = document.getElementById("cardState");
+    const cardSwatch = document.getElementById("cardSwatch");
+
+    const CARD_TICK_MS = 250;
+    const CARD_BAND_TOP = 0.34;
+    const CARD_BAND_HEIGHT = 0.36;
+    const CARD_TOLERANCE = 0.075;  // chromaticity distance that still counts
+    const CARD_GREY = 0.045;       // closer to grey than this cannot be learned
+    const CARD_MAX_WIDTH = 0.75;   // filling the view is not a card held up
+    const CARD_DEADZONE = 5;
+
+    let cardRunning = false;
+    let cardTimer = null;
+    let cardBusy = false;
+    let cardColour = null;
+
+    function chromaticity(red, green, blue) {
+      const sum = red + green + blue;
+      if (sum <= 0) return { r: 1 / 3, g: 1 / 3 };
+      return { r: red / sum, g: green / sum };
+    }
+
+    function chromaDistance(a, b) {
+      const dr = a.r - b.r;
+      const dg = a.g - b.g;
+      return Math.sqrt(dr * dr + dg * dg);
+    }
+
+    function learnCard() {
+      stopAllGames("learning the card");
+
+      torchGrab().then((frame) => {
+        const band = sampleColour(frame, CARD_BAND_TOP, CARD_BAND_HEIGHT);
+
+        // Only the middle of the view: the card is held up in front, and the
+        // edges are whatever the room happens to contain.
+        const from = Math.round(TORCH_W * 0.42);
+        const to = Math.round(TORCH_W * 0.58);
+
+        // The median column rather than the average of them. A card never
+        // fills the window exactly, and averaging blends the floor into it --
+        // which produces a colour that matches neither the card nor the
+        // floor, and a game that can see nothing at all.
+        const seen = [];
+
+        for (let x = from; x < to; x++) {
+          seen.push({
+            colour: chromaticity(band.red[x], band.green[x], band.blue[x]),
+            red: band.red[x],
+            green: band.green[x],
+            blue: band.blue[x]
+          });
+        }
+
+        const middleR = seen.map((one) => one.colour.r).sort((a, b) => a - b);
+        const middleG = seen.map((one) => one.colour.g).sort((a, b) => a - b);
+        const half = seen.length >> 1;
+        const learned = { r: middleR[half], g: middleG[half] };
+
+        // Show the column that best matches what was learned, so the swatch
+        // is a colour actually present rather than an average of the view.
+        let closest = seen[0];
+
+        for (const one of seen) {
+          if (chromaDistance(one.colour, learned) <
+              chromaDistance(closest.colour, learned)) {
+            closest = one;
+          }
+        }
+
+        const red = closest.red;
+        const green = closest.green;
+        const blue = closest.blue;
+
+        const grey = { r: 1 / 3, g: 1 / 3 };
+
+        // Grey and white have nothing to find later, so refuse rather than
+        // learn something that will match the whole room.
+        if (chromaDistance(learned, grey) < CARD_GREY) {
+          cardColour = null;
+          cardButton.disabled = true;
+          cardSwatch.hidden = true;
+          cardState.textContent =
+            "that card has no colour in it -- try a brighter one";
+          return;
+        }
+
+        cardColour = learned;
+        cardButton.disabled = false;
+
+        cardSwatch.style.background =
+          "rgb(" + Math.round(red) + "," +
+          Math.round(green) + "," + Math.round(blue) + ")";
+        cardSwatch.hidden = false;
+
+        cardState.textContent = "card learned";
+      }).catch(() => {
+        cardState.textContent = "could not read a frame";
+      });
+    }
+
+    function cardAnalyse(frame) {
+      const band = sampleColour(frame, CARD_BAND_TOP, CARD_BAND_HEIGHT);
+      const miss = (why) => ({ columns: band.luma, found: false, why });
+
+      if (!cardColour) return miss("show it the card first");
+
+      const hits = [];
+
+      for (let x = 0; x < TORCH_W; x++) {
+        const here = chromaticity(band.red[x], band.green[x], band.blue[x]);
+        hits.push(chromaDistance(here, cardColour) < CARD_TOLERANCE);
+      }
+
+      // One connected run, for the reason the line follower wants one: the
+      // average of two patches points at neither of them.
+      const runs = [];
+      let run = null;
+
+      for (let x = 0; x < TORCH_W; x++) {
+        if (!hits[x]) {
+          run = null;
+          continue;
+        }
+
+        if (!run) {
+          run = { from: x, to: x };
+          runs.push(run);
+        }
+
+        run.to = x;
+      }
+
+      const candidates = runs.filter((one) => one.to > one.from);
+
+      if (candidates.length === 0) return miss("cannot see the card");
+
+      // The widest run is the card; anything else that colour is smaller.
+      candidates.sort((a, b) => (b.to - b.from) - (a.to - a.from));
+
+      const card = candidates[0];
+      const width = card.to - card.from + 1;
+
+      if (width > TORCH_W * CARD_MAX_WIDTH) {
+        return miss("that colour is everywhere");
+      }
+
+      return {
+        columns: band.luma,
+        hits,
+        found: true,
+        centre: (card.from + card.to) / 2,
+        width
+      };
+    }
+
+    function cardDecide(sample) {
+      if (!sample.found) return "stop";
+
+      const error = sample.centre - (TORCH_W - 1) / 2;
+
+      if (error < -CARD_DEADZONE) return "left";
+      if (error > CARD_DEADZONE) return "right";
+      return "forward";
+    }
+
+    function cardDraw(sample) {
+      const band = overlayBand(sample.columns, CARD_BAND_TOP, CARD_BAND_HEIGHT);
+
+      if (!sample.found) return;
+
+      // Tint what matched, so "it is following the colour" is something a
+      // child can see rather than be told.
+      overlayCtx.fillStyle = "rgba(233, 185, 0, 0.45)";
+
+      for (let x = 0; x < TORCH_W; x++) {
+        if (sample.hits[x]) overlayCtx.fillRect(x, band.top, 1, band.rows);
+      }
+
+      overlayCtx.fillStyle = "rgba(255, 255, 255, 0.9)";
+      overlayCtx.fillRect(Math.round(sample.centre), band.top, 1, band.rows);
+    }
+
+    function cardTick() {
+      if (!cardRunning || cardBusy) return;
+      cardBusy = true;
+
+      torchGrab().then((frame) => {
+        if (!cardRunning) return;
+
+        const sample = cardAnalyse(frame);
+
+        if (frameIsCovered(frame)) {
+          stopCard("hand over the camera");
+          return;
+        }
+
+        const action = cardDecide(sample);
+
+        cardDraw(sample);
+        sendAction(action);
+
+        if (sample.found) {
+          const offset = sample.centre - (TORCH_W - 1) / 2;
+
+          videoGame.textContent =
+            "card " + (offset >= 0 ? "+" : "") + offset.toFixed(1) +
+            " → " + action;
+          cardState.textContent = "following";
+        } else {
+          videoGame.textContent = sample.why;
+          cardState.textContent = sample.why;
+        }
+      }).catch(() => {
+        stopCard("could not read a frame");
+      }).then(() => {
+        cardBusy = false;
+      });
+    }
+
+    function startCard() {
+      if (cardRunning || !cardColour) return;
+
+      cardRunning = true;
+      overlayShow(true);
+      resetCoverWatch();
+      cardButton.textContent = "Stop";
+      cardState.textContent = "starting";
+      cardTimer = setInterval(cardTick, CARD_TICK_MS);
+      cardTick();
+    }
+
+    function stopCard(why) {
+      if (!cardRunning) return;
+
+      cardRunning = false;
+      clearInterval(cardTimer);
+      cardTimer = null;
+      overlayShow(false);
+
+      sendAction("stop");
+
+      cardButton.textContent = "Start";
+      cardState.textContent = why || "not running";
+    }
+
+    cardLearn.addEventListener("click", learnCard);
+
+    cardButton.addEventListener("click", () => {
+      if (cardRunning) {
+        stopCard();
+      } else {
+        stopTorch("following the card instead");
+        stopSpin("following the card instead");
+        stopLine("following the card instead");
+        startCard();
       }
     });
 
@@ -7061,13 +7511,15 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     const gamePanels = [
       ["torch", document.getElementById("gameTorchTab"), document.getElementById("gameTorch")],
       ["spin", document.getElementById("gameSpinTab"), document.getElementById("gameSpin")],
-      ["line", document.getElementById("gameLineTab"), document.getElementById("gameLine")]
+      ["line", document.getElementById("gameLineTab"), document.getElementById("gameLine")],
+      ["card", document.getElementById("gameCardTab"), document.getElementById("gameCard")]
     ];
 
     function stopAllGames(why) {
       stopTorch(why);
       stopSpin(why);
       stopLine(why);
+      stopCard(why);
     }
 
     function showGame(name) {
