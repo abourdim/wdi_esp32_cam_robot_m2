@@ -2,6 +2,8 @@
 
 A Wi-Fi controlled ESP32-CAM robot with live camera streaming, independent motor PWM control, synchronized motor experiments, camera settings, Wi-Fi fallback AP mode, browser OTA firmware updates, debug/event logging, log export, and a UART0 USB serial console.
 
+Since **v2.0** it also has a **Games** view, where the camera stops being a camera and becomes the robot's only sensor: it follows a torch, follows a line of tape, follows a coloured card, and measures how fast it turns by watching the picture slide past. Covering the lens with a hand stops it.
+
 ## Current feature set
 
 ### Motor control
@@ -13,14 +15,34 @@ A Wi-Fi controlled ESP32-CAM robot with live camera streaming, independent motor
 - **STBY → +5V** (hard-wired enabled)
 - Motor A / J6 is treated as **left**; Motor B / J7 as **right**
 - Full PWM range for each motor: **0 to 255**
-- Independent left/right speed sliders
-- Exact **-1 / +1** PWM buttons
-- **Sync motors** checkbox:
+- A single **Speed** control on the drive screen, which moves both motors together and keeps whatever difference is set in Settings
+- Independent left/right speed sliders, in **Settings -> Robot -> Motor trim**
+- Exact **-1 / +1** PWM buttons, beside those sliders
+- **Sync motors** checkbox, also in Motor trim:
   - When enabled, changing either motor changes both motors to the same PWM value.
   - Enabling Sync uses the current left motor value as the initial reference.
+  - The drive screen does not need it: one Speed control moves both by design.
+- **Wheel direction** flags, one per wheel, for a chassis wired with a motor's leads the other way round
 - Gentle PWM soft start that ramps only to the requested motor PWM.
 - Forward, left, right, and stop controls.
 - The PCB uses a TB6612FNG H-bridge, and the browser controls are forward, backward, left, right, and stop. Reverse drives the opposite direction input; the wheels are always brought to a stop before crossing between forward and reverse.
+
+### Wheel direction
+
+Chassis are assembled by hand, and some come back with a motor's leads the
+other way round. That wheel then runs backwards for the same H-bridge inputs:
+forward and backward swap, and so do left and right, because the turn commands
+share the forward polarity.
+
+**Settings -> Robot -> Wheel direction** has a checkbox per wheel. Lift the
+wheels off the table, press forward, and tick whichever wheel turns the wrong
+way. The flags are stored on the robot and reported in `/status`, so the fix
+follows the robot rather than the browser that made it.
+
+The correction is applied in one place -- the only function that knows left
+from right -- so the soft start, the direction-change pause, the motion
+timeout and replay all stay unaware that any wheel is inverted. Changing a
+flag stops the robot first, because it is a direction reversal like any other.
 
 ### Hold to drive, and the motion timeout
 
@@ -174,7 +196,33 @@ The selected rotation is stored in the browser with `localStorage`, so it is rem
 
 ## Web user interface
 
-The robot page has two collapsible sidebars.
+The video sits at the top. Under it are three views, chosen in the header:
+**Drive**, **Program** and **Games**. The video stays above all three, so a
+program or a game can be watched while it runs.
+
+### Drive
+
+In order down the screen: the four arrows with **STOP** in the middle of them,
+one **Speed** control, and **Light**.
+
+The layout is deliberate. The control a child uses every second sits directly
+under the thing they have to watch, so on a phone the picture and the arrows
+are on screen together and driving never means scrolling. STOP is in the
+centre of the pad, where a thumb already is and reachable from any arrow, with
+the pad's gap widened so that reaching for it and missing lands on background
+rather than on a direction. Releasing an arrow stops the robot anyway -- STOP
+is the backup, not the only way.
+
+**Speed** moves both motors and preserves the trim set in Settings. Its
+ceiling is the speed limit minus that trim, so the faster wheel lands exactly
+on the limit instead of being quietly clipped.
+
+**Light** switches the flash LED. Its brightness lives in Settings -> Camera,
+so turning the light on with brightness at zero would be a control that
+visibly does nothing: the page says so instead, and the notice clears as soon
+as either half of that changes.
+
+The page also has two collapsible sidebars.
 
 ### Left sidebar: Settings
 
@@ -183,7 +231,9 @@ until you want them.
 
 **Camera** -- the camera controls listed above.
 
-**Robot** -- name, speed limit, and the measured wake-up numbers.
+**Robot** -- everything that differs from robot to robot: name, speed limit,
+wheel direction, motor trim (the Sync checkbox and the two per-motor sliders),
+and the measured wake-up numbers. It matches what the robot stores in NVS.
 
 **Wi-Fi** -- scan for networks and join one.
 
@@ -271,6 +321,114 @@ Repeats are not recorded as steps: a held button repeats itself four times a
 second and a dragged slider fires continuously, and neither is a new
 instruction.
 
+## Games
+
+Four activities in which the camera is the robot's sensor rather than a
+picture for a person. One at a time, chosen with the Torch / Turn / Line /
+Card buttons, because only one may drive the robot.
+
+While a game runs, the strip of picture it is reading is drawn **on the
+video**, over the pixels it came from, with the readout in the telemetry line.
+That is the point of the games rather than a debug aid: a child can see what
+the robot is deciding from, so "why did it turn there?" is answered by
+looking.
+
+Every game sends its commands the same way a held button does, at the same
+250 ms cadence and under the same 600 ms motion timeout. A game cannot ask the
+robot for anything a finger could not. Each stops on its own button, on
+switching game, on leaving the Games view, on the window losing focus and on
+the tab being hidden -- always sending a stop on the way out.
+
+Frames come from `/capture` on port 80, not the stream on port 81. The stream
+is a different origin, and drawing it into a canvas taints the canvas so the
+pixels cannot be read back.
+
+### A hand over the lens stops the robot
+
+Whichever game is running. Telling a covered lens from an unlit room needs
+three things at once: the frame is dark, it is flat -- a covering leaves no
+highlight anywhere -- and it is a *change* from a lit picture, because
+starting in the dark is not somebody covering anything. It reads the whole
+frame rather than the band the game is sampling, since a dim room nearly
+always has a window or a lamp somewhere in view.
+
+Two frames must agree, so one bad grab cannot stop a robot mid-game, and it
+will not fire again until the lens has seen daylight. It does not resume by
+itself: press Start again.
+
+### Follow the torch
+
+Reads a strip across the middle of the picture, averages the brightness of
+each half, and turns towards the brighter one. Dim the room, shine a phone
+torch, walk backwards. If it drives away from the torch the picture is
+mirrored -- turn off Mirror in Settings, or check Wheel direction.
+
+### How fast does it turn?
+
+The robot spins itself for two seconds each way and measures how far the
+picture slid, frame against frame, converting columns per second into degrees
+per second through the lens's field of view. Each run adds a row: requested
+speed, left, right, and the gap between them.
+
+The gap is the lesson. The two numbers should match and will not, because the
+motors are not identical -- the same truth the wake-up numbers teach, with the
+robot measuring itself this time. Below a wheel's threshold the picture does
+not move at all and the answer is zero.
+
+It measures turning and not forward speed, and that is a limit of the optics
+rather than an omission. Driving forward makes the picture expand from the
+centre instead of sliding, and how fast it expands depends on how far away the
+furniture is. Metres per second would need the camera pointed at the floor, or
+one calibration drive over a known distance. The degrees are worked out from a
+catalogue figure for the lens, so they are comparable between wheels rather
+than laboratory-accurate.
+
+### Follow the line
+
+Dark tape on a pale floor. It reads a strip along the bottom of the picture --
+the floor just in front of the wheels -- finds the darkest part, and steers to
+keep it centred. A checkbox handles a pale line on a dark floor, which is the
+same problem upside down.
+
+The threshold is relative to the darkest and brightest column in that strip
+rather than a fixed number, so a grey floor in a dim room works as well as
+white paper under a lamp, and the line's position is the centre of mass of the
+dark part weighted by darkness, so fat tape and thin tape both report their
+middle.
+
+It stops rather than guessing, and says which of four things it hit: too dark
+to see the floor, nothing that looks like tape, a dark patch too wide to be a
+line, or more than one patch and no way to tell which was meant. That last one
+matters more than it sounds: it looks for a single connected run of dark
+columns, because a lens vignette darkens both edges and averages to dead
+centre -- a confident wrong answer a child cannot debug.
+
+Turn the Speed down first. Fast is how a line follower loses the corner.
+
+### Follow the card
+
+Show the robot a brightly coloured card, then hold it to one side and it turns
+that way.
+
+It is a card and not a hand on purpose. Recognising a hand needs a model this
+page cannot load -- it is served from the robot, with no internet -- and the
+shortcut people reach for instead, testing pixels for skin colour, works for
+some children and not others. A card works for everyone, and a child can
+disprove "it follows my hand" by hiding the card and waving.
+
+**Show it the card** learns the colour rather than assuming one, so any card
+the room has will do. It learns the median column of the middle of the view,
+not the average: a card never fills that window exactly, and averaging blends
+the floor in, producing a colour that matches neither. Colours are compared as
+chromaticity -- each channel over the sum of the three -- so the match
+survives the card moving into shade. A white or grey card is refused, because
+there is nothing in it to find later.
+
+Expect to re-learn the card during a session: the camera adjusts its own
+colours as the room changes, and the card drifts with them. At four decisions
+a second it answers a moment after you move, so it works better held still to
+one side than waved like a steering wheel.
+
 ## Photos
 
 **Photo** on the strip under the video grabs a single frame from `/capture`
@@ -309,6 +467,11 @@ Settings -> Robot:
   than the browser, so it holds however the command arrives. The soft-start
   ramp never exceeds the requested value or this ceiling. Anything already
   above a new ceiling is brought down to it immediately.
+- **Wheel direction** -- one checkbox per wheel, for a chassis wired the other
+  way round. See Wheel direction above.
+- **Motor trim** -- the Sync checkbox and the two per-motor sliders. This is
+  calibration, done once per robot; the drive screen's Speed control slides
+  both together and keeps whatever difference is set here.
 
 ## Saved settings
 
@@ -317,8 +480,9 @@ Settings are split by who owns them.
 ### On the robot, in flash
 
 Camera resolution, JPEG quality, brightness, contrast, saturation, flip and
-mirror; motor speeds; LED brightness and on/off. These describe the robot, not
-your browser, so they live in NVS and come back after a power cycle.
+mirror; motor speeds; the two wheel-direction flags; LED brightness and
+on/off. These describe the robot, not your browser, so they live in NVS and
+come back after a power cycle.
 
 Putting them in the browser instead would break in two ways: a phone and a
 laptop would restore two different sets of values and overwrite each other,
@@ -334,8 +498,9 @@ it; the allocation would fail and take the stream with it.
 
 ### In the browser, in localStorage
 
-Display rotation, serial baud, terminal auto-scroll, and which Settings
-sections are open. Per-viewer preferences the robot has no opinion about.
+Display rotation, serial baud, terminal auto-scroll, which Settings sections
+are open, and which view and which game were last chosen. Per-viewer
+preferences the robot has no opinion about.
 
 The section state is saved when you click a section header, not when the
 `<details>` element toggles. Browsers reinstate `<details>` state from session
@@ -669,11 +834,37 @@ The robot control page is HTTP, not HTTPS.
 
 Anyone who can reach the robot network may be able to control the robot unless additional authentication is added.
 
+## The launcher
+
+`launch.sh` is a menu for the whole build cycle: check and install PlatformIO,
+build, flash over USB, open a serial monitor, clean, push firmware over Wi-Fi,
+and export a `.bin` for the browser uploader.
+
+Two entries open a browser instead:
+
+- **w** -- the robot's own page. Press Enter to accept `192.168.4.1`, the
+  address the fallback AP always serves on, or type the address it was given
+  by a router. The sketch registers no mDNS name, so this is by IP.
+- **h** -- `README.html`, the USB serial console page, or the project on
+  GitHub.
+
+Both go through one helper that tries `xdg-open`, `open`, `cmd`'s `start` and
+finally PowerShell, and prints the address if none of them work rather than
+failing silently. Local files are converted with `cygpath` under Git Bash,
+because `cmd` cannot follow a `/d/work/...` path.
+
+The two entries are letters, so the numbered options the rest of this document
+refers to are unchanged.
+
 ## Main files
 
-- `ESP32_Robot_Complete.ino` - complete ESP32-CAM robot firmware
+- `wdi_esp32_cam_robot_m2.ino` - the complete firmware, including the whole web UI
+- `index_html_gz.h` - the gzipped copy of that UI, regenerated by `tools/gzip_ui.py`
+- `tools/gzip_ui.py` - run it after every UI edit, or the robot serves the old page
+- `launch.sh` - build, flash, monitor, OTA, and open the robot's page
+- `platformio.ini` - board, partition scheme and build flags
 - `ESP32_Robot_USB_Serial_Console.html` - standalone localhost Web Serial terminal
-- `README.md` - this documentation
+- `readme.md` - this documentation
 - `README.html` - browser-friendly version of the documentation
 
 ## Suggested classroom experiments
@@ -685,6 +876,12 @@ Anyone who can reach the robot network may be able to control the robot unless a
 - Compare camera quality versus streaming responsiveness.
 - Compare Wi-Fi RSSI with stream smoothness.
 - Compare motor behavior with wheels lifted versus robot on the floor.
+- Measure the turn rate at several speeds and plot requested against actual.
+- Compare the left and right turn rates, and explain the gap.
+- Find the speed below which the turn rate measures zero, and compare it with
+  the wake-up numbers.
+- Time a lap of a taped course, then try to beat it by trimming the motors.
+- Work out what the line follower is actually seeing, then fool it on purpose.
 - Add encoders/Hall sensors later and compare requested PWM with actual RPM.
 
 ## Future extensions
@@ -697,7 +894,8 @@ Useful next steps:
 - Distance estimation
 - Closed-loop speed control
 - Battery voltage monitoring
-- Add a reverse control to the web UI (the TB6612FNG hardware already supports it)
-- Saved Wi-Fi configuration from the browser
 - Authentication for robot controls
-- Downloadable CSV experiment data
+- Downloadable CSV experiment data, starting with the turn-rate rows
+- Repeat blocks in the Program view, so a square is one corner four times
+- A notice when the requested speed is below a measured wake-up number
+- Metres per second, from a single calibration drive over a known distance
