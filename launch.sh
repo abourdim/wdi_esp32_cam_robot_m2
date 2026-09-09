@@ -22,6 +22,9 @@ EXPORT_DIR="$SCRIPT_DIR/export"
 DEFAULT_OTA_IP="192.168.4.1"
 DEFAULT_OTA_PASSWORD="88888888"
 
+# The project online, for the docs menu below.
+GITHUB_URL="https://github.com/abourdim/wdi_esp32_cam_robot_m2"
+
 # --- colors -----------------------------------------------------------------
 if [ -t 1 ]; then
   C_RESET='\033[0m'; C_DIM='\033[2m'
@@ -356,6 +359,97 @@ debug_build_flash_monitor() {
   fi
 }
 
+# --- browser -----------------------------------------------------------------
+# Hands a URL to whatever the platform calls a browser. Git Bash on Windows has
+# neither xdg-open nor open, so it falls through to cmd's start -- the doubled
+# slash keeps Git Bash from rewriting "//c" into a path. The empty "" is start's
+# window-title argument, without which it treats a quoted URL as the title.
+open_url() {
+  local url="$1"
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 && return 0
+  fi
+  if command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1 && return 0
+  fi
+  if command -v cmd.exe >/dev/null 2>&1; then
+    cmd.exe //c start "" "$url" >/dev/null 2>&1 && return 0
+  fi
+  if command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "Start-Process '$url'" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# Shared tail of every "open something" action: report, or print the address so
+# the user can paste it when no opener was found.
+launch_or_print() {
+  local target="$1"
+  echo
+  info "Opening $target ..."
+  if open_url "$target"; then
+    ok "Handed off to your browser."
+  else
+    err "Could not launch a browser. Open this yourself:"
+    echo "     $target"
+  fi
+}
+
+open_web() {
+  echo
+  info "The robot must be powered and this machine on the same network --"
+  info "either its own 'ESP32-Robot-XXXX' access point ($DEFAULT_OTA_IP) or a"
+  info "router it joined. The sketch registers no mDNS name, so this is by IP."
+  echo
+  read -rp "Robot IP [$DEFAULT_OTA_IP]: " ip
+  ip="${ip:-$DEFAULT_OTA_IP}"
+  # Tolerate a pasted "http://192.168.4.1/" as readily as a bare address.
+  ip="${ip#http://}"
+  ip="${ip#https://}"
+  ip="${ip%/}"
+
+  launch_or_print "http://$ip/"
+  pause
+}
+
+# The two pages the repo ships need no robot on the network: the manual, and
+# the console that drives the board over USB from a WebSerial-capable browser.
+# The third entry is the project online.
+open_docs() {
+  echo
+  echo "  1) README.html -- the full robot manual"
+  echo "  2) ESP32_Robot_USB_Serial_Console.html -- USB serial console"
+  echo "  3) GitHub repository (online)"
+  echo "  b) back"
+  read -rp "Choose an option: " choice
+
+  local file=""
+  case "$choice" in
+    1) file="$SCRIPT_DIR/README.html" ;;
+    2) file="$SCRIPT_DIR/ESP32_Robot_USB_Serial_Console.html" ;;
+    3) launch_or_print "$GITHUB_URL"; pause; return ;;
+    b|B) return ;;
+    *) warn "Unrecognized option."; pause; return ;;
+  esac
+
+  if [ ! -f "$file" ]; then
+    err "Missing: $file"
+    pause; return
+  fi
+
+  # cygpath only exists under Git Bash/MSYS, where cmd would choke on a
+  # /d/work/... path; everywhere else a file:// URL is what the opener wants.
+  local target=""
+  if command -v cygpath >/dev/null 2>&1; then
+    target="$(cygpath -w "$file")"
+  else
+    target="file://$file"
+  fi
+
+  launch_or_print "$target"
+  pause
+}
+
 main_menu() {
   while true; do
     clear 2>/dev/null || true
@@ -382,6 +476,8 @@ main_menu() {
     echo "  8) Clean build"
     echo "  9) Flash over WiFi (OTA)"
     echo "  d) Debug build + Flash + Monitor"
+    echo "  w) Open the robot web UI in a browser"
+    echo "  h) Open docs, USB console page, or GitHub"
     echo "  x) Export .bin for the browser uploader"
     echo "  q) Quit"
     echo
@@ -397,6 +493,8 @@ main_menu() {
       8) clean_firmware ;;
       9) ota_flash ;;
       d|D) debug_build_flash_monitor ;;
+      w|W) open_web ;;
+      h|H) open_docs ;;
       x|X) export_bin ;;
       q|Q) echo; info "Bye."; exit 0 ;;
       *) warn "Unrecognized option." ; sleep 1 ;;
