@@ -357,6 +357,13 @@ static int maxMotorPWM = MAX_PWM;
 static int leftThreshold = 0;
 static int rightThreshold = 0;
 
+// Whether each wheel's motor leads are wired the other way round. Chassis are
+// assembled by hand, so this differs from robot to robot: with the leads
+// swapped, the same H-bridge inputs run that wheel backwards. Both false is
+// the wiring the pinout at the top of this file describes.
+static bool invertLeftMotor = false;
+static bool invertRightMotor = false;
+
 // Starting a brushed DC motor is the electrically noisiest event on this board.
 // Use a longer monotonic ramp to the requested duty and stagger a two-motor
 // start. There is no 255 kick and no shared-enable edge at the start of motion.
@@ -817,17 +824,21 @@ static void stopMotorsUnlocked() {
 }
 
 static void writeMotorPairUnlocked(int leftPWM, int rightPWM, bool reverse) {
+  // A wheel wired backwards is corrected here, the one place that knows left
+  // from right. Everything upstream -- the soft start, the direction-change
+  // pause, record and replay -- stays unaware that any wheel is inverted.
+  // != on two bools is exclusive-or.
   writeTb6612(
     MOTOR_L_IN1_LEDC_CHANNEL,
     MOTOR_L_IN2_LEDC_CHANNEL,
     leftPWM,
-    reverse
+    reverse != invertLeftMotor
   );
   writeTb6612(
     MOTOR_R_IN1_LEDC_CHANNEL,
     MOTOR_R_IN2_LEDC_CHANNEL,
     rightPWM,
-    reverse
+    reverse != invertRightMotor
   );
 }
 
@@ -1193,6 +1204,8 @@ static void saveSettings() {
   settingsStore.putInt("rightThresh", rightThreshold);
   settingsStore.putInt("leftSpeed", leftMotorSpeed);
   settingsStore.putInt("rightSpeed", rightMotorSpeed);
+  settingsStore.putBool("invertLeft", invertLeftMotor);
+  settingsStore.putBool("invertRight", invertRightMotor);
   settingsStore.putInt("ledBright", ledBrightness);
   settingsStore.putBool("ledOn", ledEnabled);
 
@@ -1242,6 +1255,8 @@ static void loadMotorAndLedSettings() {
 
   leftMotorSpeed = clampMotorPWM(settingsStore.getInt("leftSpeed", leftMotorSpeed));
   rightMotorSpeed = clampMotorPWM(settingsStore.getInt("rightSpeed", rightMotorSpeed));
+  invertLeftMotor = settingsStore.getBool("invertLeft", false);
+  invertRightMotor = settingsStore.getBool("invertRight", false);
   ledBrightness = clampLedPWM(settingsStore.getInt("ledBright", ledBrightness));
   ledEnabled = settingsStore.getBool("ledOn", ledEnabled);
 
@@ -2511,7 +2526,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
 
     .robot {
-      width: min(620px, 100%);
+      width: min(720px, 100%);
       margin: 0 auto;
     }
 
@@ -2725,14 +2740,6 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       cursor: pointer;
     }
 
-    .ui-version {
-      margin-bottom: 10px;
-      color: #667085;
-      font-size: 11px;
-      text-align: center;
-      letter-spacing: 0.02em;
-    }
-
     .sync-row {
       display: flex;
       align-items: center;
@@ -2775,10 +2782,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       display: grid;
       grid-template-columns: repeat(3, 82px);
       grid-template-areas:
-        ". forward led"
+        ". forward ."
         "left stop right"
         ". backward .";
-      gap: 10px;
+      gap: 14px;
       justify-content: center;
       margin-top: 18px;
     }
@@ -2789,7 +2796,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       -webkit-user-select: none;
     }
 
-    .button, .led-button {
+    .button {
       border: 0;
       color: white;
       font-size: 22px;
@@ -2809,15 +2816,54 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     .stop { grid-area: stop; }
     .right { grid-area: right; }
     .backward { grid-area: backward; }
-    .led { grid-area: led; }
 
+    /* Stop sits where the thumb already is, reachable from any arrow. It says
+       the word rather than showing a dot, and the pad's gap is wide enough
+       that reaching for it and missing lands on background, not on a
+       direction. Releasing an arrow stops the robot anyway; this is the
+       backup, which is why it does not need to dominate the screen. */
     .stop {
       background: #9b2c2c;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    /* One speed control on the drive screen; the per-motor pair lives in
+       Settings, where setting them apart is the point. */
+    .drive-speed {
+      max-width: 274px;
+      margin-left: auto;
+      margin-right: auto;
     }
 
     .led-button {
-      font-size: 16px;
+      display: block;
+      width: min(100%, 274px);
+      height: 46px;
+      margin: 14px auto 0;
+      border: 0;
+      border-radius: 13px;
       background: #777;
+      color: white;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    /* Only ever written to when the light cannot do what the button says. */
+    .light-note {
+      width: min(100%, 274px);
+      margin: 8px auto 0;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: #fff5d8;
+      color: #604b08;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .light-note:empty {
+      display: none;
     }
 
     .led-on {
@@ -3330,7 +3376,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         grid-template-columns: repeat(3, 76px);
       }
 
-      .button, .led-button {
+      .button {
         width: 76px;
         height: 56px;
       }
@@ -3533,6 +3579,112 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
                min="20" max="255" step="5" value="255">
         <div class="setting-note">
           The robot refuses anything above this, however the command arrives.
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head"><strong>Wheel direction</strong></div>
+
+        <label class="sync-control">
+          <input id="invertLeft" type="checkbox">
+          Left wheel runs backwards
+        </label>
+
+        <label class="sync-control">
+          <input id="invertRight" type="checkbox">
+          Right wheel runs backwards
+        </label>
+
+        <div class="setting-note">
+          Lift the wheels off the table and press forward. Tick a wheel that
+          turns the wrong way: its motor leads are the other way round, which
+          is a difference between chassis rather than a fault. The robot stops
+          whenever either box changes.
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head"><strong>Motor trim</strong></div>
+
+      <div class="sync-row">
+        <label class="sync-control">
+          <input id="syncMotors" type="checkbox">
+          Sync motors
+        </label>
+        <span class="sync-note">When enabled, either control changes both.</span>
+      </div>
+
+      <div class="motor-control">
+        <div class="speed-row">
+          <label for="leftSpeedSlider">Left motor</label>
+          <span id="leftSpeedValue" class="speed-value">220 / 255 (86%)</span>
+        </div>
+
+        <div class="motor-adjust">
+          <button class="pwm-step" type="button"
+                  data-motor="left" data-delta="-1"
+                  aria-label="Decrease left motor speed by 1">−1</button>
+
+          <input
+            id="leftSpeedSlider"
+            class="motor-slider"
+            type="range"
+            min="0"
+            max="255"
+            step="1"
+            value="220"
+            aria-label="Left motor speed">
+
+          <button class="pwm-step" type="button"
+                  data-motor="left" data-delta="1"
+                  aria-label="Increase left motor speed by 1">+1</button>
+        </div>
+
+        <div class="speed-scale">
+          <span>0</span>
+          <span>Full range</span>
+          <span>255</span>
+        </div>
+      </div>
+
+      <div class="motor-control">
+        <div class="speed-row">
+          <label for="rightSpeedSlider">Right motor</label>
+          <span id="rightSpeedValue" class="speed-value">220 / 255 (86%)</span>
+        </div>
+
+        <div class="motor-adjust">
+          <button class="pwm-step" type="button"
+                  data-motor="right" data-delta="-1"
+                  aria-label="Decrease right motor speed by 1">−1</button>
+
+          <input
+            id="rightSpeedSlider"
+            class="motor-slider"
+            type="range"
+            min="0"
+            max="255"
+            step="1"
+            value="220"
+            aria-label="Right motor speed">
+
+          <button class="pwm-step" type="button"
+                  data-motor="right" data-delta="1"
+                  aria-label="Increase right motor speed by 1">+1</button>
+        </div>
+
+        <div class="speed-scale">
+          <span>0</span>
+          <span>Full range</span>
+          <span>255</span>
+        </div>
+      </div>
+
+        <div class="setting-note">
+          Each motor can be set independently from 0 to 255. At very low values
+          a motor may buzz without rotating; that is how a class finds the real
+          starting threshold of each one. Speed on the drive screen slides both
+          together and keeps whatever difference is set here.
         </div>
       </div>
 
@@ -3797,99 +3949,41 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     <div id="driveView">
     <div class="panel">
-      <div class="ui-version">UI: Sync + Serial + Camera Settings + Rotation</div>
-
-      <div class="sync-row">
-        <label class="sync-control">
-          <input id="syncMotors" type="checkbox">
-          Sync motors
-        </label>
-        <span class="sync-note">When enabled, either control changes both.</span>
-      </div>
-
-      <div class="motor-control">
-        <div class="speed-row">
-          <label for="leftSpeedSlider">Left motor</label>
-          <span id="leftSpeedValue" class="speed-value">220 / 255 (86%)</span>
-        </div>
-
-        <div class="motor-adjust">
-          <button class="pwm-step" type="button"
-                  data-motor="left" data-delta="-1"
-                  aria-label="Decrease left motor speed by 1">−1</button>
-
-          <input
-            id="leftSpeedSlider"
-            class="motor-slider"
-            type="range"
-            min="0"
-            max="255"
-            step="1"
-            value="220"
-            aria-label="Left motor speed">
-
-          <button class="pwm-step" type="button"
-                  data-motor="left" data-delta="1"
-                  aria-label="Increase left motor speed by 1">+1</button>
-        </div>
-
-        <div class="speed-scale">
-          <span>0</span>
-          <span>Full range</span>
-          <span>255</span>
-        </div>
-      </div>
-
-      <div class="motor-control">
-        <div class="speed-row">
-          <label for="rightSpeedSlider">Right motor</label>
-          <span id="rightSpeedValue" class="speed-value">220 / 255 (86%)</span>
-        </div>
-
-        <div class="motor-adjust">
-          <button class="pwm-step" type="button"
-                  data-motor="right" data-delta="-1"
-                  aria-label="Decrease right motor speed by 1">−1</button>
-
-          <input
-            id="rightSpeedSlider"
-            class="motor-slider"
-            type="range"
-            min="0"
-            max="255"
-            step="1"
-            value="220"
-            aria-label="Right motor speed">
-
-          <button class="pwm-step" type="button"
-                  data-motor="right" data-delta="1"
-                  aria-label="Increase right motor speed by 1">+1</button>
-        </div>
-
-        <div class="speed-scale">
-          <span>0</span>
-          <span>Full range</span>
-          <span>255</span>
-        </div>
-      </div>
-
       <div class="button-container">
         <button class="button forward drive" data-action="forward" aria-label="Forward">↑</button>
-        <button id="ledButton" class="led-button led" type="button">OFF</button>
 
         <button class="button left drive" data-action="left" aria-label="Left">←</button>
-        <button class="button stop" id="stopButton" type="button" aria-label="Stop">●</button>
+        <button class="button stop" id="stopButton" type="button" aria-label="Stop">STOP</button>
         <button class="button right drive" data-action="right" aria-label="Right">→</button>
 
         <button class="button backward drive" data-action="backward" aria-label="Backward">↓</button>
       </div>
 
-      <div class="note">
-        Each motor can be set independently from 0 to 255.
-        At very low values a motor may buzz without rotating; that lets students
-        discover the real starting threshold of each motor.
-        This PCB already uses a TB6612FNG H-bridge; this build keeps the existing forward/left/right UI while driving it through the schematic pinout.
+      <div class="motor-control drive-speed">
+        <div class="speed-row">
+          <label for="driveSpeedSlider">Speed</label>
+          <span id="driveSpeedValue" class="speed-value">220 / 255 (86%)</span>
+        </div>
+
+        <input
+          id="driveSpeedSlider"
+          class="motor-slider"
+          type="range"
+          min="0"
+          max="255"
+          step="1"
+          value="220"
+          aria-label="Speed">
+
+        <div class="speed-scale">
+          <span>Slower</span>
+          <span>Faster</span>
+        </div>
       </div>
+
+      <button id="ledButton" class="led-button" type="button">Light off</button>
+
+      <div id="lightNote" class="light-note" aria-live="polite"></div>
     </div>
     </div>
 
@@ -3985,6 +4079,10 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     const ledButton = document.getElementById("ledButton");
     const stopButton = document.getElementById("stopButton");
     const syncMotors = document.getElementById("syncMotors");
+    const driveSpeedSlider = document.getElementById("driveSpeedSlider");
+    const driveSpeedValue = document.getElementById("driveSpeedValue");
+    const invertLeft = document.getElementById("invertLeft");
+    const invertRight = document.getElementById("invertRight");
 
     const settingsToggle = document.getElementById("settingsToggle");
     const settingsSidebar = document.getElementById("settingsSidebar");
@@ -4000,6 +4098,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     const cameraSaturationValue = document.getElementById("cameraSaturationValue");
     const cameraVFlip = document.getElementById("cameraVFlip");
     const cameraHMirror = document.getElementById("cameraHMirror");
+    const lightNote = document.getElementById("lightNote");
     const ledBrightnessSlider = document.getElementById("ledBrightnessSlider");
     const ledBrightnessValue = document.getElementById("ledBrightnessValue");
     const cameraReset = document.getElementById("cameraReset");
@@ -4647,6 +4746,33 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       request("/action?" + motor + "Speed=" + v);
     }
 
+    // How far apart the two motors are held. Settings sets it; the drive
+    // screen's Speed control slides both without disturbing it.
+    let driveTrim = 0;
+
+    function syncDriveSpeedUi() {
+      const left = Number(leftSpeedSlider.value) || 0;
+      const right = Number(rightSpeedSlider.value) || 0;
+
+      driveTrim = right - left;
+
+      // Speed names the slower wheel, so the faster one still has room to sit
+      // a trim above it without being clipped at the ceiling.
+      const cap = Number(leftSpeedSlider.max) || 255;
+      driveSpeedSlider.max = String(Math.max(0, cap - Math.abs(driveTrim)));
+
+      const base = Math.min(left, right);
+      driveSpeedSlider.value = String(base);
+      driveSpeedValue.textContent = speedLabel(base);
+    }
+
+    function motorPairForSpeed(value) {
+      const base = clamp255(value);
+      return driveTrim >= 0
+        ? { left: base, right: base + driveTrim }
+        : { left: base - driveTrim, right: base };
+    }
+
     function setMotorUi(motor, value) {
       const v = clamp255(value);
 
@@ -4658,6 +4784,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         rightSpeedValue.textContent = speedLabel(v);
       }
 
+      syncDriveSpeedUi();
       return v;
     }
 
@@ -4707,6 +4834,42 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
         sendMotorSpeed(motor, v);
       }
     }
+
+    // Both wheels move together, so this emits the pair of speed steps Sync
+    // already emits -- a program recorded here replays like one recorded from
+    // the two sliders in Settings.
+    function scheduleDriveSpeed(value) {
+      const pair = motorPairForSpeed(value);
+
+      setMotorUi("left", pair.left);
+      setMotorUi("right", pair.right);
+
+      clearTimeout(leftSpeedTimer);
+      clearTimeout(rightSpeedTimer);
+
+      leftSpeedTimer = setTimeout(() => {
+        sendMotorSpeed("left", pair.left);
+        sendMotorSpeed("right", pair.right);
+      }, 60);
+    }
+
+    driveSpeedSlider.addEventListener("input", () => {
+      userAdjustedControls = true;
+      scheduleDriveSpeed(driveSpeedSlider.value);
+    });
+
+    driveSpeedSlider.addEventListener("change", () => {
+      const pair = motorPairForSpeed(driveSpeedSlider.value);
+
+      setMotorUi("left", pair.left);
+      setMotorUi("right", pair.right);
+
+      clearTimeout(leftSpeedTimer);
+      clearTimeout(rightSpeedTimer);
+
+      sendMotorSpeed("left", pair.left);
+      sendMotorSpeed("right", pair.right);
+    });
 
     leftSpeedSlider.addEventListener("input", () => {
       userAdjustedControls = true;
@@ -5357,6 +5520,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       if (data.robotName) applyRobotName(data.robotName);
       if (data.maxPwm) applySpeedCap(data.maxPwm);
       applyThresholds(data.leftThreshold, data.rightThreshold);
+      applyWheelDirection(data.invertLeft, data.invertRight);
 
       // Once only, and never over a control the driver has already touched.
       if (buildOnly || robotStateAdopted || userAdjustedControls) return;
@@ -5371,11 +5535,13 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
       ledState = Boolean(data.ledEnabled);
       ledButton.classList.toggle("led-on", ledState);
-      ledButton.textContent = ledState ? "ON" : "OFF";
+      ledButton.textContent = ledState ? "Light on" : "Light off";
 
       ledBrightnessSlider.value = String(clamp255(data.ledBrightness));
       ledBrightnessValue.textContent =
         ledBrightnessLabel(ledBrightnessSlider.value);
+
+      refreshLightNote();
     }
 
     settingsToggle.addEventListener("click", () => {
@@ -6155,7 +6321,27 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
       if (Number(leftSpeedSlider.value) > capped) setMotorUi("left", capped);
       if (Number(rightSpeedSlider.value) > capped) setMotorUi("right", capped);
+
+      syncDriveSpeedUi();
     }
+
+    function applyWheelDirection(left, right) {
+      invertLeft.checked = !!left;
+      invertRight.checked = !!right;
+    }
+
+    function sendWheelDirection() {
+      request(
+        "/action?invertLeft=" + (invertLeft.checked ? 1 : 0) +
+        "&invertRight=" + (invertRight.checked ? 1 : 0)
+      );
+
+      robotSettingsStatus.textContent =
+        "Wheel direction saved. The robot stopped.";
+    }
+
+    invertLeft.addEventListener("change", sendWheelDirection);
+    invertRight.addEventListener("change", sendWheelDirection);
 
     function applyThresholds(left, right) {
       thresholdLeft.textContent = left ? String(left) : "not measured";
@@ -6579,6 +6765,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       userAdjustedControls = true;
       const value = clamp255(ledBrightnessSlider.value);
       ledBrightnessValue.textContent = ledBrightnessLabel(value);
+      refreshLightNote();
 
       clearTimeout(ledBrightnessTimer);
       ledBrightnessTimer = setTimeout(() => {
@@ -6593,17 +6780,31 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       const value = clamp255(ledBrightnessSlider.value);
       clearTimeout(ledBrightnessTimer);
       ledBrightnessValue.textContent = ledBrightnessLabel(value);
+      refreshLightNote();
       request(
         "/action?ledBrightness=" +
         encodeURIComponent(value)
       );
     });
 
+    // Brightness lives in Settings -> Camera and the button is on the drive
+    // screen, so "Light on" with brightness at 0 leaves a child pressing a
+    // control that visibly does nothing. Say why, here, rather than expecting
+    // them to find the slider.
+    function refreshLightNote() {
+      const dark = ledState && clamp255(ledBrightnessSlider.value) === 0;
+
+      lightNote.textContent = dark
+        ? "The light is on, but brightness is 0 — turn it up in Settings → Camera."
+        : "";
+    }
+
     ledButton.addEventListener("click", () => {
       ledState = !ledState;
       ledButton.classList.toggle("led-on", ledState);
-      ledButton.textContent = ledState ? "ON" : "OFF";
+      ledButton.textContent = ledState ? "Light on" : "Light off";
       request("/action?led=" + (ledState ? "on" : "off"));
+      refreshLightNote();
     });
   </script>
 </body>
@@ -7273,6 +7474,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"maxPwm\":%d,"
     "\"leftThreshold\":%d,"
     "\"rightThreshold\":%d,"
+    "\"invertLeft\":%s,"
+    "\"invertRight\":%s,"
     "\"build\":\"%s %s\","
     "\"message\":\"%s\","
     "\"latestEventId\":%lu,"
@@ -7302,6 +7505,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
     maxMotorPWM,
     leftThreshold,
     rightThreshold,
+    invertLeftMotor ? "true" : "false",
+    invertRightMotor ? "true" : "false",
     __DATE__,
     __TIME__,
     messageCopy,
@@ -7965,6 +8170,42 @@ static esp_err_t action_handler(httpd_req_t *req) {
     noteSettingsChanged();
     httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+  }
+
+  // Wheel direction: /action?invertLeft=0|1 and /action?invertRight=0|1
+  // Set when a chassis turns out to have that motor's leads the other way
+  // round. Flipping one mid-drive is a direction reversal like any other, so
+  // the robot stops first rather than slamming a loaded gearbox.
+  {
+    bool invertChanged = false;
+
+    if (httpd_query_key_value(query, "invertLeft", value, sizeof(value)) == ESP_OK) {
+      invertLeftMotor = (atoi(value) != 0);
+      invertChanged = true;
+    }
+
+    if (httpd_query_key_value(query, "invertRight", value, sizeof(value)) == ESP_OK) {
+      invertRightMotor = (atoi(value) != 0);
+      invertChanged = true;
+    }
+
+    if (invertChanged) {
+      commandStop();
+
+      char dbg[80];
+      snprintf(
+        dbg,
+        sizeof(dbg),
+        "SETTINGS: Wheels reversed left %s, right %s",
+        invertLeftMotor ? "yes" : "no",
+        invertRightMotor ? "yes" : "no"
+      );
+      setDebugMessage(dbg);
+
+      noteSettingsChanged();
+      httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+      return ESP_OK;
+    }
   }
 
   // Speed ceiling: /action?maxPwm=1-255
