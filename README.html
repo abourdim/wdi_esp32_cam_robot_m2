@@ -773,6 +773,8 @@ ESP32_Robot_Complete/
 
 <p><code>launch.sh</code> is a menu for the whole build cycle: check and install PlatformIO, build, flash over USB, open a serial monitor, clean, push firmware over Wi-Fi, and export a <code>.bin</code> for the browser uploader.</p>
 
+<p>Every action prints the command it is about to run before running it, in the short form worth learning &mdash; <code>pio run</code>, not the full path to the executable. A menu that hides its work teaches nothing, and a child who can read the OTA line can send firmware to a robot from any terminal.</p>
+
 <p>Two entries open a browser instead:</p>
 
 <ul>

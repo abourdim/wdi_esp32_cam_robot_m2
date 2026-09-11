@@ -38,6 +38,16 @@ warn()  { echo -e "${C_AMBER}[!!]${C_RESET} $1"; }
 err()   { echo -e "${C_RED}[XX]${C_RESET} $1"; }
 info()  { echo -e "${C_CYAN}[--]${C_RESET} $1"; }
 
+# A menu that hides its work teaches nothing. Every action prints the command
+# it is about to run, in a form a child can read and type by hand, before it
+# runs it -- so the menu is a way in rather than a way around.
+show_cmd() {
+  echo
+  echo -e "${C_DIM}  the command this runs:${C_RESET}"
+  echo -e "  ${C_BOLD}$ $*${C_RESET}"
+  echo
+}
+
 banner() {
   echo -e "${C_CYAN}${C_BOLD}"
   echo "  ┌──────────────────────────────────────────────┐"
@@ -75,6 +85,10 @@ pio_run() {
     err "PlatformIO not found. Use option 2 (Install PlatformIO) first."
     return 1
   fi
+
+  # Shown as "pio", not as the full path to the executable: the short form is
+  # the one worth learning, and the one that works once PlatformIO is on PATH.
+  show_cmd "pio $*"
   "$PIO_BIN" "$@"
 }
 
@@ -107,6 +121,7 @@ check_install() {
 
   if find_pio; then
     ok "PlatformIO found at: $PIO_BIN"
+    show_cmd "pio --version"
     "$PIO_BIN" --version
   else
     warn "PlatformIO not found. Use option 2 to install it."
@@ -145,6 +160,7 @@ install_pio() {
       if ! command -v pip3 >/dev/null 2>&1; then
         err "pip3 not found. Install Python 3 + pip first, or use option 2."
       else
+        show_cmd "pip3 install -U platformio"
         pip3 install -U platformio && ok "Installed. You may need to restart your shell or add pip's bin dir to PATH."
       fi
       ;;
@@ -152,6 +168,7 @@ install_pio() {
       if ! command -v python3 >/dev/null 2>&1; then
         err "python3 not found. Install Python 3 first."
       else
+        show_cmd "curl -fsSL -o get-platformio.py https://raw.githubusercontent.com/platformio/platformio-core-installer/master/get-platformio.py && python3 get-platformio.py"
         curl -fsSL -o "${TMPDIR:-/tmp}/get-platformio.py" \
           https://raw.githubusercontent.com/platformio/platformio-core-installer/master/get-platformio.py \
           && python3 "${TMPDIR:-/tmp}/get-platformio.py" \
@@ -257,6 +274,10 @@ ota_flash() {
 
   echo
   info "Pushing $(basename "$FIRMWARE_BIN") to $ip over OTA..."
+
+  # Printed in full: this is the one command here worth keeping, and a child
+  # who can read it can send firmware to a robot from any terminal.
+  show_cmd "curl -X POST -H 'X-OTA-Password: $otapw' --data-binary @$FIRMWARE_BIN http://$ip/update"
   # "Expect:" suppresses curl's 100-continue handshake, which the ESP32's
   # httpd does not answer and which otherwise stalls the upload for a second.
   if curl -f --progress-bar \
@@ -288,6 +309,8 @@ export_bin() {
   fi
   mkdir -p "$EXPORT_DIR"
   local dest="$EXPORT_DIR/${SKETCH}.bin"
+  show_cmd "cp $FIRMWARE_BIN $dest"
+
   if cp "$FIRMWARE_BIN" "$dest"; then
     ok "Exported application image:"
     echo "     $dest"
@@ -353,8 +376,10 @@ debug_build_flash_monitor() {
   fi
 
   if [ -n "$SELECTED_PORT" ]; then
+    show_cmd "pio device monitor -e $PIO_DEBUG_ENV -b 115200 -p $SELECTED_PORT"
     (cd "$SCRIPT_DIR" && "$PIO_BIN" device monitor -e "$PIO_DEBUG_ENV" -b 115200 -p "$SELECTED_PORT")
   else
+    show_cmd "pio device monitor -e $PIO_DEBUG_ENV -b 115200"
     (cd "$SCRIPT_DIR" && "$PIO_BIN" device monitor -e "$PIO_DEBUG_ENV" -b 115200)
   fi
 }

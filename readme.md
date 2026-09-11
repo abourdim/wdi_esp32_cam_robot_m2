@@ -865,6 +865,11 @@ Anyone who can reach the robot network may be able to control the robot unless a
 build, flash over USB, open a serial monitor, clean, push firmware over Wi-Fi,
 and export a `.bin` for the browser uploader.
 
+Every action prints the command it is about to run before running it, in the
+short form worth learning -- `pio run`, not the full path to the executable.
+A menu that hides its work teaches nothing, and a child who can read the OTA
+line can send firmware to a robot from any terminal.
+
 Two entries open a browser instead:
 
 - **w** -- the robot's own page. Press Enter to accept `192.168.4.1`, the
