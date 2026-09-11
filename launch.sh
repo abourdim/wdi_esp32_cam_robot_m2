@@ -92,6 +92,29 @@ pio_run() {
   "$PIO_BIN" "$@"
 }
 
+# `pio device monitor` wants a real terminal on stdin, and Git Bash does not
+# give it one: MSYS pipes stdin through an emulation layer, so Python decides
+# it is being scripted and refuses to start. winpty ships with Git Bash and
+# hands it the console it is asking for.
+#
+# Only the monitor needs this. Everything else -- build, upload, device list --
+# runs fine without a tty, so they stay on pio_run.
+pio_monitor() {
+  if ! find_pio; then
+    err "PlatformIO not found. Use option 2 (Install PlatformIO) first."
+    return 1
+  fi
+
+  if [ -n "${MSYSTEM:-}" ] && command -v winpty >/dev/null 2>&1; then
+    show_cmd "winpty pio $*"
+    winpty "$PIO_BIN" "$@"
+    return $?
+  fi
+
+  show_cmd "pio $*"
+  "$PIO_BIN" "$@"
+}
+
 have_build() { [ -f "$FIRMWARE_BIN" ]; }
 
 # --- menu actions -------------------------------------------------------------
@@ -326,11 +349,11 @@ monitor_serial() {
   pick_port
   echo
   info "Opening serial monitor at 115200 baud. Press Ctrl+C to exit."
-  info "Console commands: help, status, log, camera, stop."
+  info "Console commands: help, status, log, camera, screen, stop."
   if [ -n "$SELECTED_PORT" ]; then
-    pio_run device monitor -b 115200 -p "$SELECTED_PORT"
+    pio_monitor device monitor -b 115200 -p "$SELECTED_PORT"
   else
-    pio_run device monitor -b 115200
+    pio_monitor device monitor -b 115200
   fi
 }
 
@@ -376,11 +399,9 @@ debug_build_flash_monitor() {
   fi
 
   if [ -n "$SELECTED_PORT" ]; then
-    show_cmd "pio device monitor -e $PIO_DEBUG_ENV -b 115200 -p $SELECTED_PORT"
-    (cd "$SCRIPT_DIR" && "$PIO_BIN" device monitor -e "$PIO_DEBUG_ENV" -b 115200 -p "$SELECTED_PORT")
+    (cd "$SCRIPT_DIR" && pio_monitor device monitor -e "$PIO_DEBUG_ENV" -b 115200 -p "$SELECTED_PORT")
   else
-    show_cmd "pio device monitor -e $PIO_DEBUG_ENV -b 115200"
-    (cd "$SCRIPT_DIR" && "$PIO_BIN" device monitor -e "$PIO_DEBUG_ENV" -b 115200)
+    (cd "$SCRIPT_DIR" && pio_monitor device monitor -e "$PIO_DEBUG_ENV" -b 115200)
   fi
 }
 
