@@ -516,6 +516,28 @@ python -m http.server 8000
 <li>The attempt runs from the main loop rather than inside the request, because the reply has to leave before the radio moves.</li>
 </ul>
 
+<h2>What the LED is telling you</h2>
+
+<p>GPIO4 is the module's flash LED, and it is the robot's only indicator. Every status pattern runs at a few percent of full scale -- it is painful to look at near full brightness, and this is a high-power LED on a board that browns out easily.</p>
+
+<p>The patterns differ by <strong>rhythm</strong> rather than by count. Nobody reliably counts blinks across a room; everybody notices fast against slow.</p>
+
+<table>
+<thead><tr><th>What you see</th><th>What it means</th></tr></thead>
+<tbody>
+<tr><td>Three short flashes, immediately on power-up</td><td>The CPU is running. If these appear, the board booted and anything that goes wrong next is software.</td></tr>
+<tr><td>A fast blip, four times a second</td><td>Trying the configured Wi-Fi. This is the ten-second window, and the blip is the dot the serial console prints, for somebody without a cable.</td></tr>
+<tr><td>Two long marks</td><td>Joined the configured network.</td></tr>
+<tr><td>Long, short, long</td><td>The configured network was unavailable, so the fallback access point is up. This is the normal case in a workshop, not a fault.</td></tr>
+<tr><td>Short flashes in groups, after the two long marks</td><td>The last group of the address it was given, one digit at a time: 137 is one flash, three flashes, seven flashes. Zero is a single long mark. Set <code>LED_ANNOUNCE_IP</code> to false to switch it off.</td></tr>
+<tr><td>One dim pulse a second</td><td>Running, joined to the configured network.</td></tr>
+<tr><td>One dim pulse every five seconds</td><td>Running on the fallback access point, or still unjoined.</td></tr>
+<tr><td>A glow that gets steadily brighter</td><td>Firmware is being written. <strong>Do not cut the power.</strong> It rises with the upload and is a glow rather than a blink so it cannot be mistaken for anything above.</td></tr>
+</tbody>
+</table>
+
+<p>The heartbeat yields to the light: switch the flash LED on from the page and the pulsing stops until you switch it off again. Boot status does not yield, because nobody has asked for the light yet at that point in the startup.</p>
+
 <h2>Wi-Fi behavior</h2>
 
 <p>At boot the robot:</p>

@@ -624,6 +624,31 @@ Some things worth knowing:
 - The attempt runs from the main loop rather than inside the request, because
   the reply has to leave before the radio moves.
 
+## What the LED is telling you
+
+GPIO4 is the module's flash LED, and it is the robot's only indicator. Every
+status pattern runs at a few percent of full scale -- it is painful to look at
+near full brightness, and this is a high-power LED on a board that browns out
+easily.
+
+The patterns differ by **rhythm** rather than by count. Nobody reliably counts
+blinks across a room; everybody notices fast against slow.
+
+| What you see | What it means |
+| --- | --- |
+| Three short flashes, immediately on power-up | The CPU is running. If these appear, the board booted and anything that goes wrong next is software. |
+| A fast blip, four times a second | Trying the configured Wi-Fi. This is the ten-second window, and the blip is the dot the serial console prints, for somebody without a cable. |
+| Two long marks | Joined the configured network. |
+| Long, short, long | The configured network was unavailable, so the fallback access point is up. This is the normal case in a workshop, not a fault. |
+| Short flashes in groups, after the two long marks | The last group of the address it was given, one digit at a time: 137 is one flash, three flashes, seven flashes. Zero is a single long mark. Set `LED_ANNOUNCE_IP` to false to switch it off. |
+| One dim pulse a second | Running, joined to the configured network. |
+| One dim pulse every five seconds | Running on the fallback access point, or still unjoined. |
+| A glow that gets steadily brighter | Firmware is being written. **Do not cut the power.** It rises with the upload and is a glow rather than a blink so it cannot be mistaken for anything above. |
+
+The heartbeat yields to the light: switch the flash LED on from the page and
+the pulsing stops until you switch it off again. Boot status does not yield,
+because nobody has asked for the light yet at that point in the startup.
+
 ## Wi-Fi behavior
 
 At boot the robot:

@@ -275,6 +275,33 @@ static const int LED_BOOT_BLINK_MS = 120;
 //
 // Peak is a percentage of full scale, deliberately, so it can be tuned in one
 // place without thinking about bit depth.
+// Boot status. Three states the robot passes through before loop() starts,
+// each with its own rhythm rather than its own count -- nobody reliably
+// counts blinks across a room, and everybody notices fast against slow.
+//
+//   joining   a blip on every retry tick: the serial dots, without the cable
+//   joined    two long marks
+//   fallback  long, short, long -- deliberately not three equal flashes,
+//             which already mean "the CPU is alive" from the boot blink
+static const float LED_STATUS_PERCENT = 5.0f;
+static const uint32_t LED_JOINING_MS = 40;
+static const uint32_t LED_MARK_LONG_MS = 350;
+static const uint32_t LED_MARK_SHORT_MS = 120;
+static const uint32_t LED_MARK_GAP_MS = 180;
+
+// After joining a router, blink the last group of the address: a pause, then
+// that many short flashes. It is the one fact nobody can read off the robot
+// without a serial cable or a lucky guess. Set false for a room of eight
+// robots all announcing themselves at once.
+static const bool LED_ANNOUNCE_IP = true;
+static const uint32_t LED_ANNOUNCE_GAP_MS = 700;
+static const uint32_t LED_ANNOUNCE_MS = 110;
+
+// Writing firmware. A rising glow rather than any kind of blink, so it cannot
+// be confused with the patterns above, and dim: a brownout while the flash is
+// being written is the one failure that needs a USB cable to undo.
+static const float LED_OTA_PEAK_PERCENT = 4.0f;
+
 static const float LED_HEARTBEAT_PEAK_PERCENT = 0.5f;
 static const uint32_t LED_HEARTBEAT_PULSE_MS = 450;
 static const uint32_t LED_HEARTBEAT_INTERVAL_LINKED_MS = 1000;
@@ -698,6 +725,48 @@ static int ledDutyFromPercent(float percent) {
   if (percent <= 0.0f) return 0;
   if (percent >= 100.0f) return LED_LEDC_MAX;
   return (int)lroundf((percent / 100.0f) * (float)LED_LEDC_MAX);
+}
+
+// Status signalling drives the channel directly and hands it back with
+// applyLedOutput() when it is done. These block, which is fine everywhere
+// they are used: boot, where nothing else is waiting, and the OTA write loop,
+// where the marks are a few milliseconds between four-kilobyte chunks.
+static void ledStatusMark(uint32_t onMs, uint32_t offMs) {
+  ledcWrite(LED_LEDC_CHANNEL, ledDutyFromPercent(LED_STATUS_PERCENT));
+  delay(onMs);
+  ledcWrite(LED_LEDC_CHANNEL, 0);
+  if (offMs) delay(offMs);
+}
+
+// Blinks a number one digit at a time -- 137 is one flash, three flashes,
+// seven flashes -- rather than as a count. Counting it out would be 137
+// flashes and most of a minute, which is how this first went in. Zero is one
+// long mark, because no flashes at all is indistinguishable from the gap
+// either side of it.
+static void ledStatusNumber(int value) {
+  int digits[3];
+  int count = 0;
+
+  if (value <= 0) {
+    digits[count++] = 0;
+  } else {
+    while (value > 0 && count < 3) {
+      digits[count++] = value % 10;
+      value /= 10;
+    }
+  }
+
+  for (int i = count - 1; i >= 0; i--) {
+    if (digits[i] == 0) {
+      ledStatusMark(LED_MARK_LONG_MS, LED_ANNOUNCE_MS);
+    } else {
+      for (int flash = 0; flash < digits[i]; flash++) {
+        ledStatusMark(LED_ANNOUNCE_MS, LED_ANNOUNCE_MS);
+      }
+    }
+
+    if (i > 0) delay(LED_ANNOUNCE_GAP_MS);
+  }
 }
 
 static void applyLedOutput() {
@@ -1851,9 +1920,12 @@ void setup() {
 
   unsigned long wifiStart = millis();
 
+  // Ten seconds is a long time to stand over a robot that is saying nothing.
+  // One blip per tick is the dot below, made visible to somebody without a
+  // serial cable -- which is everybody, in a workshop.
   while (WiFi.status() != WL_CONNECTED &&
          millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(250);
+    ledStatusMark(LED_JOINING_MS, 250 - LED_JOINING_MS);
     Serial.print(".");
   }
 
@@ -1881,6 +1953,19 @@ void setup() {
 
     Serial.print("Robot Ready! Open: http://");
     Serial.println(ip);
+
+    ledStatusMark(LED_MARK_LONG_MS, LED_MARK_GAP_MS);
+    ledStatusMark(LED_MARK_LONG_MS, 0);
+
+    // The address it was actually given, blinked out digit by digit on the
+    // one indicator this board has.
+    if (LED_ANNOUNCE_IP) {
+      delay(LED_ANNOUNCE_GAP_MS);
+
+      ledStatusNumber((int)ip[3]);
+    }
+
+    applyLedOutput();
 
     previousStaStatus = WL_CONNECTED;
   } else {
@@ -1923,6 +2008,14 @@ void setup() {
       Serial.print("Open: http://");
       Serial.println(apIp);
     }
+
+    // Long, short, long. The common case in a workshop, so it is an answer
+    // rather than an alarm -- and the five-second heartbeat goes on saying
+    // the same thing for as long as the robot is up.
+    ledStatusMark(LED_MARK_LONG_MS, LED_MARK_GAP_MS);
+    ledStatusMark(LED_MARK_SHORT_MS, LED_MARK_GAP_MS);
+    ledStatusMark(LED_MARK_LONG_MS, 0);
+    applyLedOutput();
 
     previousStaStatus = WiFi.status();
   }
@@ -9291,11 +9384,28 @@ static esp_err_t update_handler(httpd_req_t *req) {
 
     writtenTotal += written;
     remaining -= (size_t)received;
+
+    // A glow that rises with the upload: nothing else on this robot does
+    // that, so it cannot be read as any of the blink patterns. Squared for
+    // gamma, as the heartbeat is -- a linear ramp appears to leap off zero
+    // and then stall. Dim on purpose: this is the worst possible moment to
+    // add current, because a brownout mid-write needs a USB cable to undo.
+    {
+      const float progress = (float)writtenTotal / (float)firmwareSize;
+      const float shape = progress * progress;
+
+      ledcWrite(
+        LED_LEDC_CHANNEL,
+        (int)lroundf(shape * (float)ledDutyFromPercent(LED_OTA_PEAK_PERCENT))
+      );
+    }
   }
 
   free(buffer);
 
   if (receiveFailed || writtenTotal != firmwareSize) {
+    ledcWrite(LED_LEDC_CHANNEL, 0);
+    applyLedOutput();
     Update.abort();
 
     char dbg[128];
@@ -9325,6 +9435,12 @@ static esp_err_t update_handler(httpd_req_t *req) {
       (unsigned int)Update.getError()
     );
     setDebugMessage(dbg);
+
+    // An image that arrived whole and then failed validation still leaves the
+    // progress glow at full. Hand the LED back, or a robot that refused an
+    // update sits there looking like one that took it.
+    ledcWrite(LED_LEDC_CHANNEL, 0);
+    applyLedOutput();
 
     otaInProgress = false;
     httpd_resp_set_status(req, "400 Bad Request");
