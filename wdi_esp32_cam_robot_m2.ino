@@ -307,6 +307,37 @@ static const uint32_t LED_HEARTBEAT_PULSE_MS = 450;
 static const uint32_t LED_HEARTBEAT_INTERVAL_LINKED_MS = 1000;
 static const uint32_t LED_HEARTBEAT_INTERVAL_UNLINKED_MS = 5000;
 
+// Optional 128x64 SSD1306 on the UART0 pins. The console and the screen take
+// turns: an SSD1306 keeps its own framebuffer, so a frame is written in about
+// fifty milliseconds and the pins go straight back to Serial. Nothing needs to
+// hold them.
+//
+// SCL on U0T and SDA on U0R, and not the other way round. An I2C START is SDA
+// falling while SCL is high, so serial output -- which toggles U0T constantly
+// -- generates clock edges the display ignores. Swap the two and every byte
+// the robot prints becomes a burst of spurious STARTs.
+//
+// Unlike the rover this is NOT on the motor bus: a screen that is absent, or
+// unplugged mid-session, costs a probe and nothing else.
+#define USE_OLED 1
+
+#define OLED_SCL_PIN 1   // U0T
+#define OLED_SDA_PIN 3   // U0R
+#define OLED_I2C_DELAY_US 4
+#define OLED_WIDTH 128
+#define OLED_TEXT_COLS 21
+#define OLED_TEXT_ROWS 4
+
+// auto probes for a screen at boot; always and never override it.
+enum ScreenMode { SCREEN_AUTO = 0, SCREEN_ALWAYS = 1, SCREEN_NEVER = 2 };
+static int screenMode = SCREEN_AUTO;
+static bool screenPresent = false;
+static bool screenBootVerbose = false;
+static bool screenRedrawPending = false;
+
+static void screenBootLine(const char *message);
+static void screenRequestRedraw();
+
 // UART0 / USB-TTL console pins
 #define SERIAL_RX_PIN 3   // U0R
 #define SERIAL_TX_PIN 1   // U0T
@@ -483,6 +514,21 @@ static void setDebugMessage(const char *message) {
   portEXIT_CRITICAL(&debugMux);
 
   Serial.println(message);
+
+#if USE_OLED
+  // Boot is the one time a fifty-millisecond blocking write is free: the
+  // motors are stopped, the servers are not up, and there is no dead man's
+  // switch to service yet. The flag is cleared at the end of setup().
+  if (screenBootVerbose) screenBootLine(message);
+#endif
+}
+
+static const char *screenModeName() {
+  switch (screenMode) {
+    case SCREEN_ALWAYS: return "always";
+    case SCREEN_NEVER:  return "never";
+    default:            return "auto";
+  }
 }
 
 static const char *networkModeName() {
@@ -858,6 +904,306 @@ static void serviceHeartbeat() {
   }
   ledcWrite(LED_LEDC_CHANNEL, duty);
 }
+
+
+#if USE_OLED
+
+// ---- SSD1306 on a bit-banged bus -------------------------------------------
+// Open-drain throughout: drive low, release for high, never drive high. One
+// device and two short wires, so 100 kHz needs no thought about capacitance.
+
+static void oledPinsTake() {
+  pinMode(OLED_SCL_PIN, OUTPUT_OPEN_DRAIN);
+  pinMode(OLED_SDA_PIN, OUTPUT_OPEN_DRAIN);
+  digitalWrite(OLED_SCL_PIN, HIGH);
+  digitalWrite(OLED_SDA_PIN, HIGH);
+  delayMicroseconds(50);
+}
+
+// Hands the pins back to UART0. Serial.end() first, or the pin matrix keeps
+// the old attachment and the console comes back mute.
+static void oledPinsRelease() {
+  Serial.end();
+  Serial.begin(SERIAL_BAUD, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
+  Serial.setDebugOutput(false);
+}
+
+static inline void oledTick() { delayMicroseconds(OLED_I2C_DELAY_US); }
+static inline void oledScl(int level) { digitalWrite(OLED_SCL_PIN, level); oledTick(); }
+static inline void oledSda(int level) { digitalWrite(OLED_SDA_PIN, level); oledTick(); }
+
+static void oledStart() {
+  oledSda(HIGH);
+  oledScl(HIGH);
+  oledSda(LOW);
+  oledScl(LOW);
+}
+
+static void oledStop() {
+  oledSda(LOW);
+  oledScl(HIGH);
+  oledSda(HIGH);
+}
+
+// Returns true when the device pulled SDA low for the acknowledge bit.
+static bool oledWriteByte(uint8_t value) {
+  for (int bit = 0; bit < 8; bit++) {
+    oledSda((value & 0x80) ? HIGH : LOW);
+    oledScl(HIGH);
+    oledScl(LOW);
+    value <<= 1;
+  }
+
+  // Let go of SDA and read what the device does with it. Reading an
+  // open-drain output can return the latch rather than the pin, so switch to
+  // a real input for the one bit.
+  pinMode(OLED_SDA_PIN, INPUT_PULLUP);
+  oledTick();
+  oledScl(HIGH);
+
+  const bool acked = (digitalRead(OLED_SDA_PIN) == LOW);
+
+  oledScl(LOW);
+  pinMode(OLED_SDA_PIN, OUTPUT_OPEN_DRAIN);
+  digitalWrite(OLED_SDA_PIN, HIGH);
+  oledTick();
+
+  return acked;
+}
+
+static uint8_t oledAddress = 0x3C;
+
+static bool oledCommand(uint8_t command) {
+  oledStart();
+  bool ok = oledWriteByte(oledAddress << 1);
+  ok = oledWriteByte(0x00) && ok;   // Co=0, D/C#=0: a command follows
+  ok = oledWriteByte(command) && ok;
+  oledStop();
+  return ok;
+}
+
+// Probes one address with an empty write. A device that is there acknowledges
+// its address; nothing else on these pins can.
+static bool oledProbe(uint8_t address) {
+  oledStart();
+  const bool acked = oledWriteByte(address << 1);
+  oledStop();
+  return acked;
+}
+
+static const uint8_t OLED_INIT[] = {
+  0xAE,             // display off
+  0xD5, 0x80,       // clock divide
+  0xA8, 0x3F,       // multiplex: 64 rows
+  0xD3, 0x00,       // no display offset
+  0x40,             // start line 0
+  0x8D, 0x14,       // charge pump on
+  0x20, 0x00,       // horizontal addressing
+  0xA1,             // column 127 is segment 0
+  0xC8,             // scan rows backwards -- with A1 this rotates 180
+  0xDA, 0x12,       // alternate COM pins
+  0x81, 0x7F,       // contrast
+  0xD9, 0xF1,       // precharge
+  0xDB, 0x40,       // VCOMH
+  0xA4,             // follow RAM, not all-on
+  0xA6,             // not inverted
+  0x2E,             // no scrolling
+  0xAF              // display on
+};
+
+// 5x7, one byte per column, least significant bit at the top. ASCII 32..126.
+static const uint8_t OLED_FONT[] = {
+  0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x5F,0x00,0x00, 0x00,0x07,0x00,0x07,0x00,
+  0x14,0x7F,0x14,0x7F,0x14, 0x24,0x2A,0x7F,0x2A,0x12, 0x23,0x13,0x08,0x64,0x62,
+  0x36,0x49,0x55,0x22,0x50, 0x00,0x05,0x03,0x00,0x00, 0x00,0x1C,0x22,0x41,0x00,
+  0x00,0x41,0x22,0x1C,0x00, 0x14,0x08,0x3E,0x08,0x14, 0x08,0x08,0x3E,0x08,0x08,
+  0x00,0x50,0x30,0x00,0x00, 0x08,0x08,0x08,0x08,0x08, 0x00,0x60,0x60,0x00,0x00,
+  0x20,0x10,0x08,0x04,0x02, 0x3E,0x51,0x49,0x45,0x3E, 0x00,0x42,0x7F,0x40,0x00,
+  0x42,0x61,0x51,0x49,0x46, 0x21,0x41,0x45,0x4B,0x31, 0x18,0x14,0x12,0x7F,0x10,
+  0x27,0x45,0x45,0x45,0x39, 0x3C,0x4A,0x49,0x49,0x30, 0x01,0x71,0x09,0x05,0x03,
+  0x36,0x49,0x49,0x49,0x36, 0x06,0x49,0x49,0x29,0x1E, 0x00,0x36,0x36,0x00,0x00,
+  0x00,0x56,0x36,0x00,0x00, 0x08,0x14,0x22,0x41,0x00, 0x14,0x14,0x14,0x14,0x14,
+  0x00,0x41,0x22,0x14,0x08, 0x02,0x01,0x51,0x09,0x06, 0x32,0x49,0x79,0x41,0x3E,
+  0x7E,0x11,0x11,0x11,0x7E, 0x7F,0x49,0x49,0x49,0x36, 0x3E,0x41,0x41,0x41,0x22,
+  0x7F,0x41,0x41,0x22,0x1C, 0x7F,0x49,0x49,0x49,0x41, 0x7F,0x09,0x09,0x09,0x01,
+  0x3E,0x41,0x49,0x49,0x7A, 0x7F,0x08,0x08,0x08,0x7F, 0x00,0x41,0x7F,0x41,0x00,
+  0x20,0x40,0x41,0x3F,0x01, 0x7F,0x08,0x14,0x22,0x41, 0x7F,0x40,0x40,0x40,0x40,
+  0x7F,0x02,0x0C,0x02,0x7F, 0x7F,0x04,0x08,0x10,0x7F, 0x3E,0x41,0x41,0x41,0x3E,
+  0x7F,0x09,0x09,0x09,0x06, 0x3E,0x41,0x51,0x21,0x5E, 0x7F,0x09,0x19,0x29,0x46,
+  0x46,0x49,0x49,0x49,0x31, 0x01,0x01,0x7F,0x01,0x01, 0x3F,0x40,0x40,0x40,0x3F,
+  0x1F,0x20,0x40,0x20,0x1F, 0x3F,0x40,0x38,0x40,0x3F, 0x63,0x14,0x08,0x14,0x63,
+  0x07,0x08,0x70,0x08,0x07, 0x61,0x51,0x49,0x45,0x43, 0x00,0x7F,0x41,0x41,0x00,
+  0x02,0x04,0x08,0x10,0x20, 0x00,0x41,0x41,0x7F,0x00, 0x04,0x02,0x01,0x02,0x04,
+  0x40,0x40,0x40,0x40,0x40, 0x00,0x01,0x02,0x04,0x00, 0x20,0x54,0x54,0x54,0x78,
+  0x7F,0x48,0x44,0x44,0x38, 0x38,0x44,0x44,0x44,0x20, 0x38,0x44,0x44,0x48,0x7F,
+  0x38,0x54,0x54,0x54,0x18, 0x08,0x7E,0x09,0x01,0x02, 0x0C,0x52,0x52,0x52,0x3E,
+  0x7F,0x08,0x04,0x04,0x78, 0x00,0x44,0x7D,0x40,0x00, 0x20,0x40,0x44,0x3D,0x00,
+  0x7F,0x10,0x28,0x44,0x00, 0x00,0x41,0x7F,0x40,0x00, 0x7C,0x04,0x18,0x04,0x78,
+  0x7C,0x08,0x04,0x04,0x78, 0x38,0x44,0x44,0x44,0x38, 0x7C,0x14,0x14,0x14,0x08,
+  0x08,0x14,0x14,0x18,0x7C, 0x7C,0x08,0x04,0x04,0x08, 0x48,0x54,0x54,0x54,0x20,
+  0x04,0x3F,0x44,0x40,0x20, 0x3C,0x40,0x40,0x20,0x7C, 0x1C,0x20,0x40,0x20,0x1C,
+  0x3C,0x40,0x30,0x40,0x3C, 0x44,0x28,0x10,0x28,0x44, 0x0C,0x50,0x50,0x50,0x3C,
+  0x44,0x64,0x54,0x4C,0x44, 0x00,0x08,0x36,0x41,0x00, 0x00,0x00,0x7F,0x00,0x00,
+  0x00,0x41,0x36,0x08,0x00, 0x10,0x08,0x08,0x10,0x08
+};
+
+// Writes one 8-pixel row of text. One page is 128 bytes, about thirteen
+// milliseconds, so a four-line redraw is around fifty.
+static void oledWriteRow(int page, const char *text) {
+  oledCommand(0x22); oledCommand(page); oledCommand(page);      // page range
+  oledCommand(0x21); oledCommand(0); oledCommand(OLED_WIDTH - 1);
+
+  oledStart();
+  oledWriteByte(oledAddress << 1);
+  oledWriteByte(0x40);   // Co=0, D/C#=1: pixel data follows
+
+  int written = 0;
+
+  for (const char *c = text; *c && written + 6 <= OLED_WIDTH; c++) {
+    int index = (uint8_t)*c;
+    if (index < 32 || index > 126) index = '?';
+    index = (index - 32) * 5;
+
+    for (int col = 0; col < 5; col++) oledWriteByte(OLED_FONT[index + col]);
+    oledWriteByte(0x00);
+    written += 6;
+  }
+
+  while (written < OLED_WIDTH) { oledWriteByte(0x00); written++; }
+
+  oledStop();
+}
+
+// ---- what is on the glass ---------------------------------------------------
+
+static char screenLines[OLED_TEXT_ROWS][OLED_TEXT_COLS + 1];
+
+static void screenSetLine(int row, const char *text) {
+  if (row < 0 || row >= OLED_TEXT_ROWS) return;
+  strncpy(screenLines[row], text ? text : "", OLED_TEXT_COLS);
+  screenLines[row][OLED_TEXT_COLS] = '\0';
+}
+
+static void screenFlush() {
+  if (!screenPresent) return;
+
+  oledPinsTake();
+  for (int row = 0; row < OLED_TEXT_ROWS; row++) {
+    oledWriteRow(row, screenLines[row]);
+  }
+  oledPinsRelease();
+}
+
+// Boot log: four lines, scrolling. The BOOT: prefix is dropped because
+// twenty-one columns is too few to spend six on a word that is on every line.
+static void screenBootLine(const char *message) {
+  if (!screenPresent) return;
+
+  const char *text = message;
+  if (strncmp(text, "BOOT: ", 6) == 0) text += 6;
+  else if (strncmp(text, "WARN: ", 6) == 0) text += 6;
+
+  for (int row = 0; row < OLED_TEXT_ROWS - 1; row++) {
+    strcpy(screenLines[row], screenLines[row + 1]);
+  }
+  screenSetLine(OLED_TEXT_ROWS - 1, text);
+
+  screenFlush();
+}
+
+// The page it settles on: the robot's name, how to reach it, and what it is
+// running. The address is the point -- it is the one fact that otherwise needs
+// a serial cable or counting LED flashes.
+static void screenDrawStatus() {
+  if (!screenPresent) return;
+
+  char line[OLED_TEXT_COLS + 1];
+
+  screenSetLine(0, robotName);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    snprintf(line, sizeof(line), "wifi %.16s", ssid);
+  } else if (fallbackApActive) {
+    snprintf(line, sizeof(line), "AP %.18s", fallbackApSsid);
+  } else {
+    snprintf(line, sizeof(line), "no network");
+  }
+  screenSetLine(1, line);
+
+  IPAddress ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
+  snprintf(line, sizeof(line), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  screenSetLine(2, line);
+
+  snprintf(line, sizeof(line), "%s  wake %d/%d",
+           FIRMWARE_VERSION, leftThreshold, rightThreshold);
+  screenSetLine(3, line);
+
+  screenFlush();
+}
+
+// A redraw while the wheels are turning would add fifty milliseconds to the
+// dead man's switch. Nothing on the screen changes while a child is driving,
+// so it waits for the robot to stop.
+static void screenRequestRedraw() {
+  screenRedrawPending = true;
+}
+
+static void serviceScreen() {
+  if (!screenPresent || !screenRedrawPending) return;
+  if (motionState != MOTION_STOPPED) return;
+
+  screenRedrawPending = false;
+  screenDrawStatus();
+}
+
+static void screenDetect() {
+  if (screenMode == SCREEN_NEVER) {
+    screenPresent = false;
+    setDebugMessage("BOOT: Screen disabled in settings");
+    return;
+  }
+
+  oledPinsTake();
+
+  bool found = false;
+  for (uint8_t address = 0x3C; address <= 0x3D && !found; address++) {
+    if (oledProbe(address)) {
+      oledAddress = address;
+      found = true;
+    }
+  }
+
+  if (found || screenMode == SCREEN_ALWAYS) {
+    for (size_t i = 0; i < sizeof(OLED_INIT); i++) oledCommand(OLED_INIT[i]);
+
+    // Clear every page, including the four this firmware never writes.
+    for (int page = 0; page < 8; page++) oledWriteRow(page, "");
+  }
+
+  oledPinsRelease();
+
+  screenPresent = found || (screenMode == SCREEN_ALWAYS);
+
+  char dbg[64];
+  if (found) {
+    snprintf(dbg, sizeof(dbg), "BOOT: Screen found at 0x%02X", oledAddress);
+  } else if (screenMode == SCREEN_ALWAYS) {
+    snprintf(dbg, sizeof(dbg), "BOOT: No screen answered; forced on anyway");
+  } else {
+    snprintf(dbg, sizeof(dbg), "BOOT: No screen fitted");
+  }
+  setDebugMessage(dbg);
+}
+
+#else   // USE_OLED
+
+static void screenBootLine(const char *message) { (void)message; }
+static void screenRequestRedraw() {}
+static void serviceScreen() {}
+static void screenDetect() {}
+static void screenDrawStatus() {}
+
+#endif  // USE_OLED
 
 static void writeTb6612(
   uint8_t in1Channel,
@@ -1275,6 +1621,7 @@ static void saveSettings() {
   settingsStore.putInt("rightSpeed", rightMotorSpeed);
   settingsStore.putBool("invertLeft", invertLeftMotor);
   settingsStore.putBool("invertRight", invertRightMotor);
+  settingsStore.putInt("screen", screenMode);
   settingsStore.putInt("ledBright", ledBrightness);
   settingsStore.putBool("ledOn", ledEnabled);
 
@@ -1326,6 +1673,9 @@ static void loadMotorAndLedSettings() {
   rightMotorSpeed = clampMotorPWM(settingsStore.getInt("rightSpeed", rightMotorSpeed));
   invertLeftMotor = settingsStore.getBool("invertLeft", false);
   invertRightMotor = settingsStore.getBool("invertRight", false);
+
+  screenMode = settingsStore.getInt("screen", SCREEN_AUTO);
+  if (screenMode < SCREEN_AUTO || screenMode > SCREEN_NEVER) screenMode = SCREEN_AUTO;
   ledBrightness = clampLedPWM(settingsStore.getInt("ledBright", ledBrightness));
   ledEnabled = settingsStore.getBool("ledOn", ledEnabled);
 
@@ -1665,6 +2015,7 @@ static void printSerialHelp() {
   Serial.println("  log     - dump retained debug event history");
   Serial.println("  camera  - current camera settings");
   Serial.println("  stop    - emergency motor stop");
+  Serial.println("  screen  - redraw the OLED, if one is fitted");
   Serial.println();
 }
 
@@ -1692,6 +2043,15 @@ static void handleSerialCommand(char *command) {
     printSerialRobotStatus();
   } else if (strcmp(command, "log") == 0) {
     printSerialDebugHistory();
+  } else if (strcmp(command, "screen") == 0) {
+    // Forces a redraw rather than waiting for something to change, which is
+    // how you test a newly wired screen without rebooting the robot.
+    if (screenPresent) {
+      screenDrawStatus();
+      Serial.printf("SCREEN: redrawn (mode %s)\n", screenModeName());
+    } else {
+      Serial.printf("SCREEN: none fitted (mode %s)\n", screenModeName());
+    }
   } else if (strcmp(command, "camera") == 0) {
     printSerialCameraStatus();
   } else if (strcmp(command, "stop") == 0) {
@@ -1818,6 +2178,11 @@ void setup() {
 
   loadMotorAndLedSettings();
   applyLedOutput();
+
+  // Before the camera, before Wi-Fi: if a screen is fitted it should be
+  // showing the boot it is part of, not switching on at the end of it.
+  screenDetect();
+  screenBootVerbose = true;
 
   // Camera configuration
   cameraMutex = xSemaphoreCreateMutex();
@@ -2020,6 +2385,9 @@ void setup() {
     previousStaStatus = WiFi.status();
   }
 
+  screenBootVerbose = false;
+  screenDrawStatus();
+
   checkIndexGzAsset();
 
   setDebugMessage("BOOT: Starting HTTP and camera-stream servers");
@@ -2045,6 +2413,7 @@ void loop() {
   // Outside the OTA guard on purpose: a firmware write is exactly when you
   // most want to see that the board is still alive.
   serviceHeartbeat();
+  serviceScreen();
   serviceSettingsSave();
   serviceWifiApply();
 
@@ -3873,6 +4242,26 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
           a motor may buzz without rotating; that is how a class finds the real
           starting threshold of each one. Speed on the drive screen slides both
           together and keeps whatever difference is set here.
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-head">
+          <strong>Screen</strong>
+          <span id="screenState" class="setting-value">--</span>
+        </div>
+
+        <select id="screenMode" class="camera-select">
+          <option value="auto">Use one if it is fitted</option>
+          <option value="always">Always on</option>
+          <option value="never">Never (keep the serial console clear)</option>
+        </select>
+
+        <div class="setting-note">
+          An optional screen shares the two console wires, borrowing them for
+          about a tenth of a second whenever it redraws. Choose Never before a
+          long session with a serial cable; the robot finds the screen by
+          itself otherwise.
         </div>
       </div>
 
@@ -5873,6 +6262,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
       if (data.maxPwm) applySpeedCap(data.maxPwm);
       applyThresholds(data.leftThreshold, data.rightThreshold);
       applyWheelDirection(data.invertLeft, data.invertRight);
+      applyScreen(data.screenMode, data.screenPresent);
 
       // Once only, and never over a control the driver has already touched.
       if (buildOnly || robotStateAdopted || userAdjustedControls) return;
@@ -7676,6 +8066,8 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     const robotNameSave = document.getElementById("robotNameSave");
     const speedCapSlider = document.getElementById("speedCapSlider");
     const speedCapValue = document.getElementById("speedCapValue");
+    const screenModeSelect = document.getElementById("screenMode");
+    const screenState = document.getElementById("screenState");
     const thresholdLeft = document.getElementById("thresholdLeft");
     const thresholdRight = document.getElementById("thresholdRight");
     const robotSettingsStatus = document.getElementById("robotSettingsStatus");
@@ -7725,6 +8117,19 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
     invertLeft.addEventListener("change", sendWheelDirection);
     invertRight.addEventListener("change", sendWheelDirection);
+
+    function applyScreen(mode, present) {
+      if (document.activeElement !== screenModeSelect) {
+        screenModeSelect.value = mode || "auto";
+      }
+
+      screenState.textContent = present ? "fitted" : "not found";
+    }
+
+    screenModeSelect.addEventListener("change", () => {
+      request("/action?screen=" + encodeURIComponent(screenModeSelect.value));
+      robotSettingsStatus.textContent = "Screen set to " + screenModeSelect.value + ".";
+    });
 
     function applyThresholds(left, right) {
       thresholdLeft.textContent = left ? String(left) : "not measured";
@@ -8859,6 +9264,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"rightThreshold\":%d,"
     "\"invertLeft\":%s,"
     "\"invertRight\":%s,"
+    "\"screenMode\":\"%s\","
+    "\"screenPresent\":%s,"
     "\"build\":\"%s %s\","
     "\"message\":\"%s\","
     "\"latestEventId\":%lu,"
@@ -8890,6 +9297,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
     rightThreshold,
     invertLeftMotor ? "true" : "false",
     invertRightMotor ? "true" : "false",
+    screenModeName(),
+    screenPresent ? "true" : "false",
     __DATE__,
     __TIME__,
     messageCopy,
@@ -9571,6 +9980,31 @@ static esp_err_t action_handler(httpd_req_t *req) {
 
     char dbg[80];
     snprintf(dbg, sizeof(dbg), "SETTINGS: Robot name is now %s", robotName);
+    setDebugMessage(dbg);
+
+    screenRequestRedraw();
+    noteSettingsChanged();
+    httpd_resp_send(req, "", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+  }
+
+  // Screen: /action?screen=auto|always|never
+  // Re-probes straight away rather than waiting for a reboot, so wiring a
+  // screen and seeing whether it works is one round trip.
+  if (httpd_query_key_value(query, "screen", value, sizeof(value)) == ESP_OK) {
+    if (strcmp(value, "always") == 0) {
+      screenMode = SCREEN_ALWAYS;
+    } else if (strcmp(value, "never") == 0) {
+      screenMode = SCREEN_NEVER;
+    } else {
+      screenMode = SCREEN_AUTO;
+    }
+
+    screenDetect();
+    screenDrawStatus();
+
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "SETTINGS: Screen mode %s", screenModeName());
     setDebugMessage(dbg);
 
     noteSettingsChanged();
