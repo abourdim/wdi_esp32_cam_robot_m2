@@ -913,6 +913,16 @@ static void serviceHeartbeat() {
 // device and two short wires, so 100 kHz needs no thought about capacitance.
 
 static void oledPinsTake() {
+  // Anything listening on U0T decodes the bit-banged edges as serial data,
+  // so a terminal sees a short burst of garbage every time the pins are
+  // borrowed. It cannot be prevented -- the wire is the wire -- but it can
+  // be kept out of the middle of a sentence: finish what is being printed,
+  // and start the noise on a line of its own.
+  Serial.flush();
+  Serial.println();
+  Serial.flush();
+  delay(2);
+
   pinMode(OLED_SCL_PIN, OUTPUT_OPEN_DRAIN);
   pinMode(OLED_SDA_PIN, OUTPUT_OPEN_DRAIN);
   digitalWrite(OLED_SCL_PIN, HIGH);
@@ -926,6 +936,11 @@ static void oledPinsRelease() {
   Serial.end();
   Serial.begin(SERIAL_BAUD, SERIAL_8N1, SERIAL_RX_PIN, SERIAL_TX_PIN);
   Serial.setDebugOutput(false);
+
+  // The receiver is most likely mid-frame on the last bit-banged edge; give
+  // it a stop bit's worth of idle line and a fresh line to start from.
+  delay(2);
+  Serial.println();
 }
 
 static inline void oledTick() { delayMicroseconds(OLED_I2C_DELAY_US); }
